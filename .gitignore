@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+
+# Large artifacts / outputs
+main/Crane-main/results/
+main/Crane-main/checkpoints/
+main/Crane-main/data/
+*.pth
+
+# Client-provided materials (avoid publishing by default)
+客户需求/
+客户需求.zip

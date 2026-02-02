@@ -1,0 +1,344 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+import models
+from models import Crane
+from models.prompt_ensemble import PromptLearner
+from models.feature_refinement import FeatureRefinementModule
+from dataset.dataset import Dataset
+from __init__ import DATASETS_ROOT
+
+from utils.transform import get_transform
+from utils.visualization import visualizer
+from utils.metrics import image_level_metrics, pixel_level_metrics
+from utils.logger import get_logger, save_args_to_file
+from utils.similarity import calc_similarity_logits, regrid_upsample
+from utils import (
+    setup_seed,
+    turn_gradient_off,
+    str2bool,
+    make_human_readable_name,
+)
+
+from scipy.ndimage import gaussian_filter
+import pandas as pd 
+import sys
+import os
+import subprocess
+import argparse
+from tqdm import tqdm
+from tabulate import tabulate
+import math
+
+from termcolor import colored
+
+def _aggregate_text_features_banks(text_pos, text_neg, batch_size, normal_num, anormaly_num):
+    if normal_num > 1:
+        text_pos = text_pos.view(batch_size, normal_num, -1).mean(dim=1)
+    if anormaly_num > 1:
+        text_neg = text_neg.view(batch_size, anormaly_num, -1).mean(dim=1)
+    return torch.stack([text_pos, text_neg], dim=1)
+
+
+def _encode_text_features_mc(model, prompt_learner, image_features, args):
+    n_samples = int(args.bayes_num_samples) if getattr(args, "use_bayes_prompt", False) else 1
+    total = None
+    for _ in range(n_samples):
+        prompts, tokenized_prompts, compound_prompts_text, is_train_with_img_cls = prompt_learner(img_emb=image_features)
+
+        if is_train_with_img_cls:
+            tf_pos = model.encode_text_learn(prompts[0], tokenized_prompts[0], compound_prompts_text).float()
+            tf_neg = model.encode_text_learn(prompts[1], tokenized_prompts[1], compound_prompts_text).float()
+            tf = _aggregate_text_features_banks(
+                tf_pos,
+                tf_neg,
+                batch_size=image_features.shape[0],
+                normal_num=prompt_learner.normal_num,
+                anormaly_num=prompt_learner.anormaly_num,
+            )
+        else:
+            tf_all = model.encode_text_learn(prompts, tokenized_prompts, compound_prompts_text).float()
+            tf_pos = tf_all[: prompt_learner.normal_num].mean(dim=0, keepdim=True)
+            tf_neg = tf_all[prompt_learner.normal_num :].mean(dim=0, keepdim=True)
+            tf = torch.stack([tf_pos.squeeze(0), tf_neg.squeeze(0)], dim=0).unsqueeze(0)
+
+        tf = F.normalize(tf, dim=-1)
+        total = tf if total is None else (total + tf)
+
+    return total / float(n_samples)
+
+
+def _encode_text_features_mc_static(model, prompt_learner, args, device):
+    n_samples = int(args.bayes_num_samples) if getattr(args, "use_bayes_prompt", False) else 1
+    total = None
+    for _ in range(n_samples):
+        prompts, tokenized_prompts, compound_prompts_text, _ = prompt_learner()
+        tf_all = model.encode_text_learn(prompts, tokenized_prompts, compound_prompts_text).float()
+        tf_pos = tf_all[: prompt_learner.normal_num].mean(dim=0, keepdim=True)
+        tf_neg = tf_all[prompt_learner.normal_num :].mean(dim=0, keepdim=True)
+        tf = torch.stack([tf_pos.squeeze(0), tf_neg.squeeze(0)], dim=0).unsqueeze(0)
+        tf = F.normalize(tf, dim=-1).to(device)
+        total = tf if total is None else (total + tf)
+    return total / float(n_samples)
+
+class ScoreCalculator(nn.Module):
+    def __init__(self, base_model, class_details, args,
+                 prompt_learner, score_base_pooling, feature_refinement_module=None):
+        super().__init__()
+        self.model = base_model
+        self.class_details = class_details
+        self.args = args
+
+        self.prompt_learner = prompt_learner
+        self.sbp = score_base_pooling
+        self.frm = feature_refinement_module
+        self._cached_text = {}
+
+    def forward(self, image):
+        with torch.no_grad():
+            image_features, patch_list = self.model.encode_image(image, self.args.features_list, self_cor_attn_layers=20)
+            # patch_features = torch.stack(patch_list, dim=0)
+        if self.frm is not None:
+            image_features = self.frm(image_features)
+            patch_list = [self.frm(pf) for pf in patch_list]
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True) 
+        patch_features = [patch_feature / patch_feature.norm(dim=-1, keepdim=True) for patch_feature in patch_list] # Note 
+        patch_features = torch.stack(patch_features, dim=0) 
+        # image_features = F.normalize(image_features, dim=-1)
+        # patch_features = F.normalize(patch_features, dim=-1)
+        
+        if getattr(self.args, "use_bayes_prompt", False) and getattr(self.args, "bayes_condition_on_image", True):
+            text_features = _encode_text_features_mc(self.model, self.prompt_learner, image_features, self.args)
+        elif self.args.train_with_img_cls_prob != 0:
+            text_features = _encode_text_features_mc(self.model, self.prompt_learner, image_features, self.args)
+        else:
+            text_features = self.text_features.to(image.device)
+
+        # Similarity Map - Segmentation
+        #########################################################################
+        pixel_logits_list = []
+        for patch_feature in patch_features:
+            pixel_logits = calc_similarity_logits(patch_feature, text_features)
+            pixel_logits_list.append(pixel_logits)
+
+        if self.args.soft_mean:    
+            similarity_maps = [regrid_upsample(pl.softmax(dim=-1), args.image_size) for pl in pixel_logits_list]
+            score_map = torch.stack(similarity_maps).mean(dim=0)
+        else:
+            logits_maps = [regrid_upsample(pl, args.image_size) for pl in pixel_logits_list]
+            mean_logits_map = torch.stack(logits_maps).mean(dim=0)
+            score_map = mean_logits_map.softmax(dim=-1)
+        anomaly_map = score_map[..., 1]
+
+        # Classification Score
+        #########################################################################
+        if self.args.use_scorebase_pooling:
+            alpha = 0.5
+            clustered_feature = self.sbp.forward(patch_features, pixel_logits_list)
+            image_features = alpha * clustered_feature + (1 - alpha) * image_features
+            image_features = F.normalize(image_features, dim=1)
+
+        image_logits = calc_similarity_logits(image_features, text_features)
+        image_pred = image_logits.softmax(dim=-1)
+        anomaly_score = image_pred[:, 1].detach()
+
+        return anomaly_score, anomaly_map 
+
+def compute_metrics_for_object(obj, dataset_results):
+    dataset_results[obj]['imgs_masks'] = torch.stack(dataset_results[obj]['imgs_masks'])
+    dataset_results[obj]['anomaly_maps'] = torch.stack(dataset_results[obj]['anomaly_maps'])
+    
+    image_auroc = image_level_metrics(dataset_results, obj, "image-auroc")
+    image_ap = image_level_metrics(dataset_results, obj, "image-ap")
+    image_f1 = image_level_metrics(dataset_results, obj, "image-f1")
+
+    pixel_auroc = pixel_level_metrics(dataset_results, obj, "pixel-auroc")
+    pixel_aupro = pixel_level_metrics(dataset_results, obj, "pixel-aupro")
+    pixel_f1 = pixel_level_metrics(dataset_results, obj, "pixel-f1")
+
+    dataset_results[obj] = None
+    return {
+        "pixel_auroc": pixel_auroc,
+        "pixel_aupro": pixel_aupro,
+        "pixel_f1": pixel_f1,
+        "image_auroc": image_auroc,
+        "image_ap": image_ap,
+        "image_f1": image_f1,
+    }
+
+def process_dataset(model, dataloader, class_details, args): 
+    Crane_parameters = {"Prompt_length": args.n_ctx, "learnabel_text_embedding_depth": args.depth, "learnabel_text_embedding_length": args.t_n_ctx, 'others': args}
+    prompt_learner = PromptLearner(model, Crane_parameters)
+    checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
+    missing_keys, unexpected_keys = prompt_learner.load_state_dict(checkpoint["prompt_learner"], strict=True)
+    assert len(missing_keys) == 0, f"Missing keys in state dict: {missing_keys}"
+    assert len(unexpected_keys) == 0, f"Unexpected keys in state dict: {unexpected_keys}"
+    prompt_learner = prompt_learner.cuda()
+    
+    score_base_pooling = Crane.ScoreBasePooling()
+    frm = None
+    if "feature_refinement_module" in checkpoint:
+        dim = model.ln_final.weight.shape[0]
+        frm = FeatureRefinementModule(
+            dim=dim,
+            mode=getattr(args, "frm_type", "scalar"),
+            alpha_init=float(getattr(args, "frm_alpha_init", 0.0)),
+        )
+        frm.load_state_dict(checkpoint["feature_refinement_module"], strict=True)
+        frm = frm.cuda()
+
+    score_calc = ScoreCalculator(
+        model, class_details, args,
+        prompt_learner=prompt_learner,
+        score_base_pooling=score_base_pooling,
+        feature_refinement_module=frm,
+    )
+    
+    if args.train_with_img_cls_prob == 0 and not (getattr(args, "use_bayes_prompt", False) and getattr(args, "bayes_condition_on_image", True)):
+        with torch.no_grad():
+            text_features = _encode_text_features_mc_static(model, prompt_learner, args, device="cuda")
+        score_calc.text_features = text_features
+
+    dp_calc = nn.DataParallel(score_calc)
+    dp_calc.eval()
+    dp_calc.cuda()
+    
+    results = {obj: {'gt_sp': [], 'pr_sp': [], 'imgs_masks': [], 'anomaly_maps': [], 'img_paths': []}
+            for obj in class_details[1]}
+    for items in tqdm(dataloader, desc="Processing test samples"):
+        anomaly_score, anomaly_map = dp_calc(items['img'].cuda())
+        anomaly_map = torch.stack([torch.from_numpy(gaussian_filter(i, sigma=args.sigma)) for i in anomaly_map.detach().cpu()], dim=0)
+
+        for i in range(items['abnorm_mask'].size(0)):
+            inst_cls = items['cls_id'][i].item()
+            results[inst_cls]['anomaly_maps'].append(anomaly_map[i].cpu())
+            results[inst_cls]['pr_sp'].append(anomaly_score[i].cpu())
+            results[inst_cls]['imgs_masks'].append(items['abnorm_mask'][i].squeeze(0))
+            results[inst_cls]['gt_sp'].append(items['anomaly'][i])
+            results[inst_cls]['img_paths'].append(items['img_path'][i])
+    
+    torch.cuda.empty_cache()
+        
+    class_names, class_ids = class_details
+    if args.visualize:
+        for clss, dic in results.items():
+            visualizer(dic['img_paths'], dic['anomaly_maps'], dic['imgs_masks'], 518, f'{args.model_name}/{args.dataset}/{args.log_dir}/{class_names[clss]}', draw_contours=True)
+
+    epoch_metrics = []
+    for obj_id in class_ids:
+        print(f'calculating metrics for {class_names[obj_id]}')
+        class_metrics = compute_metrics_for_object(obj_id, results)
+        class_metrics['objects'] = class_names[obj_id]
+        epoch_metrics.append(class_metrics)
+        
+    return epoch_metrics
+
+def generate_epoch_performance_table(epoch_metrics_dataframe, class_names):
+    epoch_metrics_dataframe = pd.DataFrame(epoch_metrics_dataframe).set_index('objects')
+    epoch_metrics_dataframe = epoch_metrics_dataframe.loc[class_names] # Sort
+    epoch_metrics_dataframe.loc['mean'] = epoch_metrics_dataframe.mean()
+    results = tabulate(epoch_metrics_dataframe, headers='keys', tablefmt="pipe", floatfmt=".03f")
+    return results
+
+def evaluate(model, items, class_details, args):
+    save_path = f'{args.save_path}/{args.log_dir}/epoch_{args.epoch}/'
+    logger = get_logger(save_path)
+    batch_size=min(8*len(args.devices), args.batch_size) # So not to overflow the gpu memory
+    print(f"process_dataset, Batch size: {batch_size}")
+    # dataloader = DataLoader(items, batch_size=args.batch_size, shuffle=False)
+    dataloader = DataLoader(items, batch_size=batch_size, shuffle=False, num_workers=8, prefetch_factor=2, pin_memory=True,)
+    epoch_metrics = process_dataset(model, dataloader, class_details, args)
+    epoch_report = generate_epoch_performance_table(epoch_metrics, class_details[0])
+    
+    print(args.dataset)
+    logger.info("\n%s", epoch_report)
+    
+def test(args):        
+    Crane_parameters = {"Prompt_length": args.n_ctx, "learnabel_text_embedding_depth": args.depth,\
+                                "learnabel_text_embedding_length": args.t_n_ctx, 'others': args}
+    model, _ = models.load("ViT-L/14@336px", device='cuda', design_details=Crane_parameters)
+    model.visual.replace_with_EAttn(to_layer=20, type=args.attn_type)
+    if args.dino_model != 'none':
+        model.use_DAttn(args.dino_model)
+    model = turn_gradient_off(model)
+
+    preprocess, target_transform = get_transform(args)
+    test_data = Dataset(roots=args.data_path, transform=preprocess, target_transform=target_transform, \
+                                dataset_name=args.dataset, kwargs=args)
+    class_details = (test_data.cls_names, test_data.class_ids)
+
+    evaluate(model, test_data, class_details, args)
+
+if __name__ == '__main__':    
+    parser = argparse.ArgumentParser("Crane", add_help=True)
+    # model
+    parser.add_argument("--model_name", type=str, default="trained_on_mvtec_default", help="model_name")
+    parser.add_argument("--seed", type=int, default=111, help="random seed")
+    parser.add_argument("--visualize", type=str2bool, default=False)
+    
+    parser.add_argument("--type", type=str, default='test') 
+    parser.add_argument("--devices", nargs='+', type=int, default=[0])
+    parser.add_argument("--epoch", type=int, default=5) 
+    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--aug_rate", type=float, default=0.0, help="augmentation rate")
+
+    parser.add_argument("--datasets_root_dir", type=str, default=f"{DATASETS_ROOT}")
+    parser.add_argument("--dataset", type=str, default="mvtec")
+    parser.add_argument("--portion", type=float, default=1) # 0.02
+    parser.add_argument("--k_shot", type=int, default=0, help="number of samples per class. 0 means use all data.")
+
+    parser.add_argument("--depth", type=int, default=9, help="image size")
+    parser.add_argument("--n_ctx", type=int, default=12, help="zero shot")
+    parser.add_argument("--t_n_ctx", type=int, default=4, help="zero shot")    
+    parser.add_argument("--train_with_img_cls_prob", type=float, default=0)
+    parser.add_argument("--train_with_img_cls_type", type=str, choices=["none", "replace_prefix", "replace_suffix", "pad_prefix", "pad_suffix"], default="pad_suffix")
+
+    # Bayes-PFL (text-side plugin)
+    parser.add_argument("--use_bayes_prompt", type=str2bool, default=False)
+    parser.add_argument("--bayes_num_samples", type=int, default=8)
+    parser.add_argument("--bayes_flow_steps", type=int, default=4)
+    parser.add_argument("--bayes_condition_on_image", type=str2bool, default=True)
+    parser.add_argument("--bayes_init_logstd", type=float, default=math.log(0.02))
+
+    # Feature refinement (attention-ish, minimal-risk)
+    parser.add_argument("--frm_type", type=str, choices=["scalar", "linear"], default="scalar")
+    parser.add_argument("--frm_alpha_init", type=float, default=0.0)
+
+    parser.add_argument("--dino_model", type=str, choices=['none', 'dinov2', 'dino', 'sam'], default='dinov2')
+    parser.add_argument("--use_scorebase_pooling", type=str2bool, default=True)
+
+    parser.add_argument("--image_size", type=int, default=518, help="input image size")
+    parser.add_argument("--features_list", type=int, nargs="+", default=[24], help="layer features used")
+    parser.add_argument("--sigma", type=int, default=4, help="zero shot")
+    parser.add_argument("--soft_mean", type=str2bool, default=False) 
+
+    parser.add_argument("--attn_type", type=str, choices=["vv", "kk", "qq", "qq+kk", "qq+kk+vv", "(q+k+v)^2"], default="qq+kk+vv")
+    parser.add_argument("--both_eattn_dattn", type=str2bool, default=True)
+
+    parser.add_argument("--why", type=str, help="Explanation about this experiment and how it is different other than parameter values")
+    args = parser.parse_args()
+    
+    if 'CUDA_VISIBLE_DEVICES' not in os.environ: # Forcing all the tensors to be on the specified device(s)
+        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, args.devices)) if len(args.devices) > 1 else str(args.devices[0])
+        command = [sys.executable,  __file__, ] + sys.argv[1:] 
+        process = subprocess.Popen(command, env=os.environ)
+        process.wait()
+        
+    else:
+        setup_seed(args.seed)
+        args.log_dir = make_human_readable_name(args)        
+        
+        args.data_path = [f"{args.datasets_root_dir}/{args.dataset}/"]
+        args.checkpoint_path = f'./checkpoints/{args.model_name}/epoch_{args.epoch}.pth'
+        args.save_path = f'./results/{args.model_name}/test_on_{args.dataset}/'
+
+        print(f"Testing on dataset from: {args.data_path}") 
+        print(f"Results will be saved to: {colored(args.save_path+args.log_dir, 'green')}")
+
+        save_args_to_file(args, sys.argv[1:], log_dir=args.log_dir)
+
+        test(args)
+        
