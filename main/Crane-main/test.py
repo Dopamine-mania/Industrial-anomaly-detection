@@ -300,6 +300,7 @@ if __name__ == '__main__':
     parser.add_argument("--use_bayes_prompt", type=str2bool, default=False)
     parser.add_argument("--bayes_num_samples", type=int, default=8)
     parser.add_argument("--bayes_flow_steps", type=int, default=4)
+    parser.add_argument("--bayes_flow_type", type=str, choices=["planar", "residual"], default="planar")
     parser.add_argument("--bayes_condition_on_image", type=str2bool, default=True)
     parser.add_argument("--bayes_init_logstd", type=float, default=math.log(0.02))
 

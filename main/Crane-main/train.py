@@ -77,6 +77,25 @@ def _encode_text_features_mc(model, prompt_learner, image_features, args):
     return tf, kl_mean
 
 
+def _find_latest_checkpoint(save_path: str):
+    ckpt_dir = os.path.abspath(save_path)
+    if not os.path.isdir(ckpt_dir):
+        return None, 0
+    best_epoch = 0
+    best_path = None
+    for name in os.listdir(ckpt_dir):
+        if not (name.startswith("epoch_") and name.endswith(".pth")):
+            continue
+        try:
+            epoch_num = int(name[len("epoch_") : -len(".pth")])
+        except ValueError:
+            continue
+        if epoch_num > best_epoch:
+            best_epoch = epoch_num
+            best_path = os.path.join(ckpt_dir, name)
+    return best_path, best_epoch
+
+
 def train(args):
     logger = get_logger(args.save_path)
 
@@ -118,6 +137,21 @@ def train(args):
     if frm is not None:
         frm.to(device)
 
+    # Auto-resume (best-effort): reload prompt_learner (+ optional FRM) from the latest epoch_*.pth
+    start_epoch = 0
+    if getattr(args, "auto_resume", True) or getattr(args, "resume_path", None):
+        ckpt_path = getattr(args, "resume_path", None)
+        ckpt_epoch = 0
+        if ckpt_path is None:
+            ckpt_path, ckpt_epoch = _find_latest_checkpoint(args.save_path)
+        if ckpt_path is not None and ckpt_epoch > 0:
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+            prompt_learner.load_state_dict(checkpoint["prompt_learner"], strict=True)
+            if frm is not None and "feature_refinement_module" in checkpoint:
+                frm.load_state_dict(checkpoint["feature_refinement_module"], strict=True)
+            start_epoch = ckpt_epoch
+            logger.info(f"Auto-resume from {ckpt_path} (epoch {ckpt_epoch})")
+
     ##########################################################################################
     params = list(prompt_learner.parameters())
     if frm is not None:
@@ -139,7 +173,7 @@ def train(args):
 
     model.eval()
     prompt_learner.train()
-    for epoch in tqdm(range(args.epoch)):
+    for epoch in tqdm(range(start_epoch, args.epoch)):
         loss_list = []
 
         with tqdm(train_dataloader) as batch_tqdm:
@@ -246,6 +280,8 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument("--aug_rate", type=float, default=0.0, help="augmentation rate")
     parser.add_argument("--train_good_only", type=str2bool, default=True, help="train split normal-only (anti-leakage)")
+    parser.add_argument("--auto_resume", type=str2bool, default=True, help="auto resume from latest checkpoint")
+    parser.add_argument("--resume_path", type=str, default=None, help="explicit checkpoint path to resume from")
 
     parser.add_argument("--dataset", type=str, nargs="+", default=[f'{ds}' for ds in dss], help="train dataset name")
     parser.add_argument("--k_shot", type=int, default=0, help="samples per class for few-shot learning. 0 means use all data.")
@@ -270,6 +306,7 @@ if __name__ == '__main__':
     parser.add_argument("--use_bayes_prompt", type=str2bool, default=False)
     parser.add_argument("--bayes_num_samples", type=int, default=8)
     parser.add_argument("--bayes_flow_steps", type=int, default=4)
+    parser.add_argument("--bayes_flow_type", type=str, choices=["planar", "residual"], default="planar")
     parser.add_argument("--bayes_kl_weight", type=float, default=0.01)
     parser.add_argument("--bayes_condition_on_image", type=str2bool, default=True)
     parser.add_argument("--bayes_init_logstd", type=float, default=math.log(0.02))

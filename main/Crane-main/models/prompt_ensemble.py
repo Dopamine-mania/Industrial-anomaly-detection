@@ -7,6 +7,8 @@ import math
 from typing import Union, List
 from pkg_resources import packaging
 
+from .bayes_pfl.flows import Planar
+
 # 0. [前置] 分词函数 Crane-main/models/simple_tokenizer.py
 _tokenizer = _Tokenizer()
 def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: bool = False) -> Union[torch.IntTensor, torch.LongTensor]:
@@ -82,6 +84,7 @@ class PromptLearner(nn.Module):
 
         self.bayes_flow_steps = int(getattr(args, "bayes_flow_steps", 4))
         self.bayes_condition_on_image = bool(getattr(args, "bayes_condition_on_image", True))
+        self.bayes_flow_type = getattr(args, "bayes_flow_type", "planar")
         self._last_kl = None
 
         ### 初始化 深层可学习提示
@@ -118,10 +121,23 @@ class PromptLearner(nn.Module):
             nn.init.zeros_(self.ctx_cond_pos.bias)
             nn.init.zeros_(self.ctx_cond_neg.bias)
 
-            self.prompt_flow = nn.ModuleList([nn.Linear(ctx_dim, ctx_dim) for _ in range(self.bayes_flow_steps)])
-            for layer in self.prompt_flow:
-                nn.init.normal_(layer.weight, std=0.02)
-                nn.init.zeros_(layer.bias)
+            if self.bayes_flow_type == "planar":
+                self.planar_flows = nn.ModuleList([Planar() for _ in range(self.bayes_flow_steps)])
+                # amortized flow params conditioned on image embedding (ISD-style)
+                self.amor_u = nn.Linear(ctx_dim, self.bayes_flow_steps * ctx_dim)
+                self.amor_w = nn.Linear(ctx_dim, self.bayes_flow_steps * ctx_dim)
+                self.amor_b = nn.Linear(ctx_dim, self.bayes_flow_steps)
+                nn.init.zeros_(self.amor_u.weight)
+                nn.init.zeros_(self.amor_w.weight)
+                nn.init.zeros_(self.amor_b.weight)
+                nn.init.zeros_(self.amor_u.bias)
+                nn.init.zeros_(self.amor_w.bias)
+                nn.init.zeros_(self.amor_b.bias)
+            else:
+                self.prompt_flow = nn.ModuleList([nn.Linear(ctx_dim, ctx_dim) for _ in range(self.bayes_flow_steps)])
+                for layer in self.prompt_flow:
+                    nn.init.normal_(layer.weight, std=0.02)
+                    nn.init.zeros_(layer.bias)
 
 
         # NOTE: removing class description index
@@ -137,6 +153,12 @@ class PromptLearner(nn.Module):
         tokenized_prompts_neg = [tokenize(p_neg) for p_neg in prompts_neg]
         tokenized_prompts_pos = torch.cat(tokenized_prompts_pos) # 'X X X X X X X X X X X X object.'
         tokenized_prompts_neg = torch.cat(tokenized_prompts_neg) # 'X X X X X X X X X X X X damaged object.'
+
+        # Keep tokenized prompts on the same device as CLIP token embedding to avoid
+        # CPU/CUDA mismatch in inference (test.py constructs PromptLearner with model on CUDA).
+        token_device = clip_model.token_embedding.weight.device
+        tokenized_prompts_pos = tokenized_prompts_pos.to(device=token_device)
+        tokenized_prompts_neg = tokenized_prompts_neg.to(device=token_device)
         with torch.no_grad():
             embedding_pos = clip_model.token_embedding(tokenized_prompts_pos).type(dtype)
             embedding_neg = clip_model.token_embedding(tokenized_prompts_neg).type(dtype)
@@ -179,8 +201,33 @@ class PromptLearner(nn.Module):
         eps = torch.randn_like(mean)
         ctx = mean + std * eps
 
-        for layer in getattr(self, "prompt_flow", []):
-            ctx = ctx + torch.tanh(layer(ctx))
+        if self.bayes_flow_type == "planar":
+            if img_emb is None:
+                # no conditioning available; use zero params => identity
+                return ctx, 0.5 * (mean.pow(2) + std.pow(2) - 1.0 - 2.0 * logstd).mean()
+
+            B = img_emb.shape[0]
+            D = img_emb.shape[-1]
+            u = self.amor_u(img_emb).view(B, self.bayes_flow_steps, D).unsqueeze(-1)  # (B,K,D,1)
+            w = self.amor_w(img_emb).view(B, self.bayes_flow_steps, D).unsqueeze(2)   # (B,K,1,D)
+            b = self.amor_b(img_emb).view(B, self.bayes_flow_steps, 1, 1)             # (B,K,1,1)
+
+            # ctx: (B, ..., D) -> (B, M, D)
+            orig_shape = ctx.shape
+            ctx2 = ctx.view(B, -1, D)
+            M = ctx2.shape[1]
+            z = ctx2.reshape(B * M, D)
+
+            for k, flow in enumerate(self.planar_flows):
+                u_k = u[:, k, :, :].repeat_interleave(M, dim=0)  # (B*M,D,1)
+                w_k = w[:, k, :, :].repeat_interleave(M, dim=0)  # (B*M,1,D)
+                b_k = b[:, k, :, :].repeat_interleave(M, dim=0)  # (B*M,1,1)
+                z, _ = flow(z, u_k, w_k, b_k)
+
+            ctx = z.view(B, M, D).view(orig_shape)
+        else:
+            for layer in getattr(self, "prompt_flow", []):
+                ctx = ctx + torch.tanh(layer(ctx))
 
         # KL(N(mean, std) || N(0, 1))
         kl = 0.5 * (mean.pow(2) + std.pow(2) - 1.0 - 2.0 * logstd).mean()

@@ -1,0 +1,7 @@
+image_ap,image_auroc,image_f1,log_path,model_name,pixel_aupro,pixel_auroc,pixel_f1,test_dataset
+0.671,0.345,0.834,main/Crane-main/results/trained_on_visa_baseline/test_on_mvtec/4e53e325/epoch_1/log.txt,trained_on_visa_baseline,0.364,0.738,0.12,mvtec
+0.516,0.386,0.72,main/Crane-main/results/trained_on_mvtec_bayes_dino/test_on_visa/93d2063f/epoch_1/log.txt,trained_on_mvtec_bayes_dino,0.52,0.848,0.115,visa
+0.496,0.365,0.722,main/Crane-main/results/trained_on_mvtec_baseline/test_on_visa/4e53e325/epoch_1/log.txt,trained_on_mvtec_baseline,0.234,0.613,0.022,visa
+0.976,0.94,0.937,main/Crane-main/results/trained_on_visa_cranep/test_on_mvtec/magnesium-massachusetts/epoch_5/log.txt,trained_on_visa_cranep,0.881,0.912,0.437,mvtec
+0.906,0.89,0.856,main/Crane-main/results/trained_on_visa_cranep/test_on_visa/magnesium-massachusetts/epoch_5/log.txt,trained_on_visa_cranep,0.907,0.96,0.319,visa
+0.8,0.551,0.84,main/Crane-main/results/trained_on_visa_bayes_dino/test_on_mvtec/93d2063f/epoch_1/log.txt,trained_on_visa_bayes_dino,0.59,0.852,0.281,mvtec
