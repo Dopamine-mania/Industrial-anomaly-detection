@@ -63,16 +63,27 @@ def _maybe_reserve_vram(args, device: str):
     if need_bytes <= 0:
         return None
 
-    # Allocate fp16 to reduce overhead; keep headroom by backing off if OOM.
+    # Allocate fp16 to reduce overhead. Use chunked allocations to avoid
+    # huge single tensors (can hit internal size limits and crash).
+    chunk_mb = int(getattr(args, "vram_reserve_chunk_mb", 256) or 256)
+    chunk_bytes = max(16 * 1024**2, chunk_mb * 1024**2)
     elem_bytes = 2
-    n_elems = max(1, need_bytes // elem_bytes)
-    while n_elems > 0:
+
+    reserved = []
+    remaining = need_bytes
+    while remaining > 0:
+        alloc_bytes = min(chunk_bytes, remaining)
+        n_elems = max(1, alloc_bytes // elem_bytes)
         try:
-            return torch.empty((n_elems,), dtype=torch.float16, device="cuda")
+            reserved.append(torch.empty((n_elems,), dtype=torch.float16, device="cuda"))
+            remaining -= n_elems * elem_bytes
         except Exception:
-            # back off 10% until it fits
-            n_elems = int(n_elems * 0.9)
-    return None
+            # back off chunk size; stop if too small to make progress
+            if chunk_bytes <= 16 * 1024**2:
+                break
+            chunk_bytes = int(chunk_bytes * 0.5)
+
+    return reserved if reserved else None
 
 def _aggregate_text_features_banks(text_pos, text_neg, batch_size, normal_num, anormaly_num):
     if normal_num > 1:
@@ -364,6 +375,7 @@ if __name__ == '__main__':
     parser.add_argument("--aug_rate", type=float, default=0.0, help="augmentation rate")
     parser.add_argument("--vram_reserve_frac", type=float, default=0.0, help="reserve GPU VRAM to this used fraction (0 disables)")
     parser.add_argument("--vram_reserve_gb", type=float, default=0.0, help="reserve GPU VRAM to this used GB (0 disables)")
+    parser.add_argument("--vram_reserve_chunk_mb", type=int, default=256, help="VRAM reserve allocation chunk size (MB)")
     parser.add_argument("--train_good_only", type=str2bool, default=True, help="train split normal-only (anti-leakage)")
     parser.add_argument("--auto_resume", type=str2bool, default=True, help="auto resume from latest checkpoint")
     parser.add_argument("--resume_path", type=str, default=None, help="explicit checkpoint path to resume from")
