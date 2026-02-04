@@ -11,6 +11,7 @@ main/Crane-main/data/
 
 # Local plots
 main/analysis/ablation.png
+main/runs/
 
 # Client-provided materials (avoid publishing by default)
 客户需求/

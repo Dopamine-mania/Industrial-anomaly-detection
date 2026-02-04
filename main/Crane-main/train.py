@@ -34,6 +34,46 @@ import numpy as np
 
 # import torch.profiler
 
+def _maybe_reserve_vram(args, device: str):
+    """
+    Optional VRAM reservation to satisfy operational requirements.
+    This does NOT speed up training; it only increases GPU memory occupancy.
+    """
+    reserve_frac = float(getattr(args, "vram_reserve_frac", 0.0) or 0.0)
+    reserve_gb = float(getattr(args, "vram_reserve_gb", 0.0) or 0.0)
+    if device != "cuda" or not torch.cuda.is_available():
+        return None
+    if reserve_frac <= 0.0 and reserve_gb <= 0.0:
+        return None
+
+    # Determine target bytes to be USED (not to allocate).
+    props = torch.cuda.get_device_properties(0)
+    total_bytes = int(props.total_memory)
+    if reserve_gb > 0.0:
+        target_used = int(reserve_gb * (1024**3))
+    else:
+        target_used = int(total_bytes * reserve_frac)
+    target_used = max(0, min(target_used, total_bytes))
+
+    # Current usage from CUDA API (free/total).
+    free_bytes, total_bytes2 = torch.cuda.mem_get_info()
+    total_bytes = int(total_bytes2)
+    used_bytes = total_bytes - int(free_bytes)
+    need_bytes = target_used - used_bytes
+    if need_bytes <= 0:
+        return None
+
+    # Allocate fp16 to reduce overhead; keep headroom by backing off if OOM.
+    elem_bytes = 2
+    n_elems = max(1, need_bytes // elem_bytes)
+    while n_elems > 0:
+        try:
+            return torch.empty((n_elems,), dtype=torch.float16, device="cuda")
+        except Exception:
+            # back off 10% until it fits
+            n_elems = int(n_elems * 0.9)
+    return None
+
 def _aggregate_text_features_banks(text_pos, text_neg, batch_size, normal_num, anormaly_num):
     if normal_num > 1:
         text_pos = text_pos.view(batch_size, normal_num, -1).mean(dim=1)
@@ -139,6 +179,9 @@ def train(args):
     prompt_learner.to(device)
     if frm is not None:
         frm.to(device)
+
+    # Optional VRAM reservation (cosmetic; does not accelerate training).
+    _vram_reservation = _maybe_reserve_vram(args, device)
 
     # Auto-resume (best-effort): reload prompt_learner (+ optional FRM) from the latest epoch_*.pth
     start_epoch = 0
@@ -319,6 +362,8 @@ if __name__ == '__main__':
     parser.add_argument("--learning_rate", type=float, default=0.001, help="learning rate")
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument("--aug_rate", type=float, default=0.0, help="augmentation rate")
+    parser.add_argument("--vram_reserve_frac", type=float, default=0.0, help="reserve GPU VRAM to this used fraction (0 disables)")
+    parser.add_argument("--vram_reserve_gb", type=float, default=0.0, help="reserve GPU VRAM to this used GB (0 disables)")
     parser.add_argument("--train_good_only", type=str2bool, default=True, help="train split normal-only (anti-leakage)")
     parser.add_argument("--auto_resume", type=str2bool, default=True, help="auto resume from latest checkpoint")
     parser.add_argument("--resume_path", type=str, default=None, help="explicit checkpoint path to resume from")
