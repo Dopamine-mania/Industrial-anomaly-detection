@@ -8,6 +8,7 @@ from typing import Union, List
 from pkg_resources import packaging
 
 from .bayes_pfl.flows import Planar
+from .bayes_pfl.pfl import Encoder, Decoder, PlanarPFL, PlanarPFLState, binary_loss_function
 
 # 0. [前置] 分词函数 Crane-main/models/simple_tokenizer.py
 _tokenizer = _Tokenizer()
@@ -85,7 +86,12 @@ class PromptLearner(nn.Module):
         self.bayes_flow_steps = int(getattr(args, "bayes_flow_steps", 4))
         self.bayes_condition_on_image = bool(getattr(args, "bayes_condition_on_image", True))
         self.bayes_flow_type = getattr(args, "bayes_flow_type", "planar")
+        self.bayes_align_official = bool(getattr(args, "bayes_align_official", True))
+        self.bayes_kl_weight = float(getattr(args, "bayes_kl_weight", 0.01))
         self._last_kl = None
+        self._last_pfl_loss = None
+        self._cached_state_n = None
+        self._cached_state_a = None
 
         ### 初始化 深层可学习提示
         ctx_dim = clip_model.ln_final.weight.shape[0]
@@ -139,6 +145,25 @@ class PromptLearner(nn.Module):
                     nn.init.normal_(layer.weight, std=0.02)
                     nn.init.zeros_(layer.bias)
 
+            # Bayes-PFL official-style alignment: PlanarPFL (image-specific) + PlanarPFLState (image-agnostic)
+            if self.bayes_align_official:
+                hidden = max(64, ctx_dim // 2)
+                self._pfl_embed_dim = ctx_dim
+
+                self._pfl_ctx_encoder = Encoder(ctx_dim, hidden, ctx_dim)
+                self._pfl_ctx_decoder = Decoder(ctx_dim, hidden, ctx_dim)
+                self._pfl_state_encoder = Encoder(ctx_dim, hidden, ctx_dim)
+                self._pfl_state_decoder = Decoder(ctx_dim, hidden, ctx_dim)
+
+                self.pfl_context = PlanarPFL(self._pfl_ctx_encoder, self._pfl_ctx_decoder, embed_dim=ctx_dim, num_flows=self.bayes_flow_steps)
+                self.pfl_state_normal = PlanarPFLState(self._pfl_state_encoder, self._pfl_state_decoder, embed_dim=ctx_dim, num_flows=self.bayes_flow_steps)
+                self.pfl_state_abnormal = PlanarPFLState(self._pfl_state_encoder, self._pfl_state_decoder, embed_dim=ctx_dim, num_flows=self.bayes_flow_steps)
+
+                # Match Bayes-PFL initialization convention (normal vs abnormal separated)
+                with torch.no_grad():
+                    self.pfl_state_normal.state.normal_(mean=0.5, std=0.02)
+                    self.pfl_state_abnormal.state.normal_(mean=-0.5, std=0.02)
+
 
         # NOTE: removing class description index
         ###  构造提示模板字符串
@@ -184,13 +209,93 @@ class PromptLearner(nn.Module):
     def bayes_kl_loss(self):
         return self._last_kl
 
-    def _bayes_sample_ctx(self, ctx_mean, ctx_logstd, img_emb, cond_proj):
+    def bayes_pfl_loss(self):
+        return self._last_pfl_loss
+
+    def _maybe_compute_pfl_biases(self, img_emb):
+        if not (self.use_bayes_prompt and self.bayes_align_official and img_emb is not None):
+            self._last_pfl_loss = None
+            return None, None
+
+        x = img_emb.float()
+        # image-specific distribution
+        x_recon, z_mu, z_std, log_det_j, z0, zk = self.pfl_context(x)
+        _, rec, kl = binary_loss_function(
+            x_recon,
+            x,
+            z_mu,
+            z_std,
+            z0,
+            zk,
+            log_det_j,
+            z_size=self._pfl_embed_dim,
+            beta=0.0,
+            if_rec=True,
+        )
+
+        # image-agnostic distributions (cache in eval mode for stability, similar to official code)
+        if self.training or self._cached_state_n is None or self._cached_state_a is None:
+            x_recon_n, z_mu_n, z_std_n, log_det_j_n, z0_n, zk_n = self.pfl_state_normal()
+            x_recon_a, z_mu_a, z_std_a, log_det_j_a, z0_a, zk_a = self.pfl_state_abnormal()
+            if not self.training:
+                self._cached_state_n = zk_n.detach()
+                self._cached_state_a = zk_a.detach()
+        else:
+            # Recompute for loss terms? In eval we don't need loss; keep deterministic state samples.
+            x_recon_n = z_mu_n = z_std_n = log_det_j_n = z0_n = None
+            x_recon_a = z_mu_a = z_std_a = log_det_j_a = z0_a = None
+            zk_n = self._cached_state_n.to(device=img_emb.device, dtype=img_emb.dtype)
+            zk_a = self._cached_state_a.to(device=img_emb.device, dtype=img_emb.dtype)
+
+        if self.training:
+            # For state distributions we follow the official "if_rec=False": regularize only.
+            _, _rec_n, kl_n = binary_loss_function(
+                x_recon_n,
+                self.pfl_state_normal.state,
+                z_mu_n,
+                z_std_n,
+                z0_n,
+                zk_n,
+                log_det_j_n,
+                z_size=self._pfl_embed_dim,
+                beta=0.0,
+                if_rec=False,
+            )
+            _, _rec_a, kl_a = binary_loss_function(
+                x_recon_a,
+                self.pfl_state_abnormal.state,
+                z_mu_a,
+                z_std_a,
+                z0_a,
+                zk_a,
+                log_det_j_a,
+                z_size=self._pfl_embed_dim,
+                beta=0.0,
+                if_rec=False,
+            )
+
+            self._last_pfl_loss = rec + self.bayes_kl_weight * (kl + kl_n + kl_a)
+        else:
+            self._last_pfl_loss = None
+
+        # biases: context uses zk (image-specific), state uses zk_n/zk_a (image-agnostic)
+        zk = zk.to(device=img_emb.device, dtype=img_emb.dtype)
+        zk_n = zk_n.to(device=img_emb.device, dtype=img_emb.dtype)
+        zk_a = zk_a.to(device=img_emb.device, dtype=img_emb.dtype)
+        return zk, (zk_n, zk_a)
+
+    def _bayes_sample_ctx(self, ctx_mean, ctx_logstd, img_emb, cond_proj, shift_vec=None):
         # Expand logstd to match ctx_mean shape
         logstd = ctx_logstd
         if ctx_mean.dim() == 5 and logstd.dim() == 4:
             logstd = logstd.unsqueeze(0).expand(ctx_mean.shape[0], -1, -1, -1, -1)
 
         mean = ctx_mean
+        if shift_vec is not None:
+            shift = shift_vec.to(dtype=mean.dtype, device=mean.device)
+            while shift.dim() < mean.dim():
+                shift = shift.unsqueeze(1)
+            mean = mean + shift
         if img_emb is not None and self.bayes_condition_on_image:
             shift = cond_proj(img_emb).to(dtype=mean.dtype, device=mean.device)
             while shift.dim() < mean.dim():
@@ -296,8 +401,20 @@ class PromptLearner(nn.Module):
             ctx_neg = self.ctx_neg.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)  # [batch_size, 1, 1, 12or6, 768]
 
             if self.use_bayes_prompt:
-                ctx_pos, kl_pos = self._bayes_sample_ctx(ctx_pos, self.ctx_pos_logstd, img_emb, self.ctx_cond_pos)
-                ctx_neg, kl_neg = self._bayes_sample_ctx(ctx_neg, self.ctx_neg_logstd, img_emb, self.ctx_cond_neg)
+                shift_ctx, shift_state = self._maybe_compute_pfl_biases(img_emb)
+                if shift_ctx is not None and shift_state is not None:
+                    shift_n, shift_a = shift_state
+                    shift_pos = shift_ctx + shift_n.expand_as(shift_ctx)
+                    shift_neg = shift_ctx + shift_a.expand_as(shift_ctx)
+                    ctx_pos, kl_pos = self._bayes_sample_ctx(
+                        ctx_pos, self.ctx_pos_logstd, img_emb, self.ctx_cond_pos, shift_vec=shift_pos
+                    )
+                    ctx_neg, kl_neg = self._bayes_sample_ctx(
+                        ctx_neg, self.ctx_neg_logstd, img_emb, self.ctx_cond_neg, shift_vec=shift_neg
+                    )
+                else:
+                    ctx_pos, kl_pos = self._bayes_sample_ctx(ctx_pos, self.ctx_pos_logstd, img_emb, self.ctx_cond_pos)
+                    ctx_neg, kl_neg = self._bayes_sample_ctx(ctx_neg, self.ctx_neg_logstd, img_emb, self.ctx_cond_neg)
                 self._last_kl = kl_pos + kl_neg
             else:
                 self._last_kl = None

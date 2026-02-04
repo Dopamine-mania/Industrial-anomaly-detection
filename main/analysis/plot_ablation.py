@@ -20,12 +20,17 @@ def to_float(x: str):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--summary_csv", type=Path, default=Path("main/analysis/summary.csv"))
-    ap.add_argument("--out_png", type=Path, default=Path("main/analysis/ablation.png"))
+    ap.add_argument("--out_png", type=Path, default=None)
     ap.add_argument("--metric", type=str, default="image_auroc", choices=["image_auroc", "pixel_auroc"])
     ap.add_argument(
         "--order",
         nargs="+",
-        default=["trained_on_mvtec_baseline", "trained_on_mvtec_plus_dino", "trained_on_mvtec_plus_bayes", "trained_on_mvtec_plus_attention"],
+        default=[
+            "trained_on_mvtec_baseline",
+            "trained_on_mvtec_bayes_dino",
+            "trained_on_visa_baseline",
+            "trained_on_visa_bayes_dino",
+        ],
         help="model_name order for plotting",
     )
     args = ap.parse_args()
@@ -52,17 +57,17 @@ def main():
 
     import matplotlib.pyplot as plt
 
-    args.out_png.parent.mkdir(parents=True, exist_ok=True)
+    out_png = args.out_png or Path(f"main/analysis/ablation_{args.metric}.png")
+    out_png.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(10, 4))
     plt.bar(labels, values)
     plt.ylabel(args.metric)
     plt.title(f"Ablation ({args.metric})")
     plt.grid(axis="y", linestyle="--", alpha=0.3)
     plt.tight_layout()
-    plt.savefig(args.out_png, dpi=200)
-    print(f"Wrote {args.out_png}")
+    plt.savefig(out_png, dpi=200)
+    print(f"Wrote {out_png}")
 
 
 if __name__ == "__main__":
     main()
-

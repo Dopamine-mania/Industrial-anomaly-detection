@@ -43,7 +43,10 @@ def _aggregate_text_features_banks(text_pos, text_neg, batch_size, normal_num, a
 
 
 def _encode_text_features_mc(model, prompt_learner, image_features, args):
-    n_samples = int(args.bayes_num_samples) if getattr(args, "use_bayes_prompt", False) else 1
+    if getattr(args, "use_bayes_prompt", False):
+        n_samples = int(getattr(args, "bayes_num_samples_train", 1))
+    else:
+        n_samples = 1
     total = None
     kl_total = None
     for _ in range(n_samples):
@@ -186,20 +189,57 @@ def train(args):
                     patch_features = patch_features.permute(1, 0, *range(2, patch_features.dim())) # 4, N, L, C
                 else:
                     image = items['img'].to(device)
-                    image_features, patch_features = model.encode_image(image, args.features_list, self_cor_attn_layers=20)
+                    # Fast Bayes-PFL-aligned training: avoid dense patch similarity maps (very expensive).
+                    # We only need global image features here.
+                    if getattr(args, "use_bayes_prompt", False) and getattr(args, "bayes_align_official", True):
+                        image_features, patch_features = model.encode_image(image, [], self_cor_attn_layers=20)
+                    else:
+                        image_features, patch_features = model.encode_image(image, args.features_list, self_cor_attn_layers=20)
                     # patch_features = torch.stack(patch_features, dim=0) 
                 if frm is not None:
                     image_features = frm(image_features)
-                    patch_features = [frm(pf) for pf in patch_features]
+                    if isinstance(patch_features, list):
+                        patch_features = [frm(pf) for pf in patch_features]
+                    elif torch.is_tensor(patch_features):
+                        patch_features = frm(patch_features)
 
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                patch_features = [patch_feature / patch_feature.norm(dim=-1, keepdim=True) for patch_feature in patch_features] # Note 
-                patch_features = torch.stack(patch_features, dim=0) 
+                if isinstance(patch_features, list):
+                    if len(patch_features) > 0:
+                        patch_features = [pf / pf.norm(dim=-1, keepdim=True) for pf in patch_features]
+                        patch_features = torch.stack(patch_features, dim=0)
+                    else:
+                        patch_features = None
+                elif torch.is_tensor(patch_features):
+                    patch_features = patch_features / patch_features.norm(dim=-1, keepdim=True)
             
                 # Text Features
                 #########################################################################
                 text_features, kl_loss = _encode_text_features_mc(model, prompt_learner, image_features, args)
                 text_features = text_features.float()  # (B,2,C) or (1,2,C)
+
+                # Bayes-PFL aligned objective: image-level contrast (+ optional PFL regularizer).
+                if getattr(args, "use_bayes_prompt", False) and getattr(args, "bayes_align_official", True):
+                    image_logits = calc_similarity_logits(image_features, text_features, temp=0.01)
+                    ce_img2txt_loss = F.cross_entropy(image_logits, label.long().to(device))
+
+                    pfl_loss = prompt_learner.bayes_pfl_loss()
+                    if pfl_loss is None:
+                        pfl_loss = torch.zeros([], device=device)
+
+                    ls = float(getattr(args, "bayes_img_ce_weight", 0.2)) * ce_img2txt_loss + float(
+                        getattr(args, "bayes_pfl_weight", 1.0)
+                    ) * pfl_loss
+
+                    optimizer.zero_grad()
+                    ls.backward()
+                    optimizer.step()
+
+                    loss_list.append((0.0, 0.0, ce_img2txt_loss.item()))
+                    batch_tqdm.set_description(
+                        f"ce_fc_ls: {0.0:.3f}, bcd_dice_ls: {0.0:.3f}, ce_img_ls: {ce_img2txt_loss:.3f}"
+                    )
+                    continue
 
                 # Similarity Map - Segmentation
                 #########################################################################
@@ -310,6 +350,10 @@ if __name__ == '__main__':
     parser.add_argument("--bayes_kl_weight", type=float, default=0.01)
     parser.add_argument("--bayes_condition_on_image", type=str2bool, default=True)
     parser.add_argument("--bayes_init_logstd", type=float, default=math.log(0.02))
+    parser.add_argument("--bayes_align_official", type=str2bool, default=True)
+    parser.add_argument("--bayes_num_samples_train", type=int, default=1)
+    parser.add_argument("--bayes_pfl_weight", type=float, default=1.0)
+    parser.add_argument("--bayes_img_ce_weight", type=float, default=0.2)
 
     # Feature refinement (attention-ish, minimal-risk)
     parser.add_argument("--use_feature_refinement_module", type=str2bool, default=False)

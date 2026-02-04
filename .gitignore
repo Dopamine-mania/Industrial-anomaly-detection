@@ -9,6 +9,9 @@ main/Crane-main/checkpoints/
 main/Crane-main/data/
 *.pth
 
+# Local plots
+main/analysis/ablation.png
+
 # Client-provided materials (avoid publishing by default)
 客户需求/
 客户需求.zip
