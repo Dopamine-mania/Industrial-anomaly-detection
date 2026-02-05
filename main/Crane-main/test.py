@@ -249,7 +249,17 @@ def evaluate(model, items, class_details, args):
     batch_size=min(8*len(args.devices), args.batch_size) # So not to overflow the gpu memory
     print(f"process_dataset, Batch size: {batch_size}")
     # dataloader = DataLoader(items, batch_size=args.batch_size, shuffle=False)
-    dataloader = DataLoader(items, batch_size=batch_size, shuffle=False, num_workers=8, prefetch_factor=2, pin_memory=True,)
+    num_workers = int(getattr(args, "num_workers", 4))
+    prefetch_factor = int(getattr(args, "prefetch_factor", 2))
+    dl_kwargs = dict(
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    if num_workers > 0:
+        dl_kwargs["prefetch_factor"] = prefetch_factor
+    dataloader = DataLoader(items, **dl_kwargs)
     epoch_metrics = process_dataset(model, dataloader, class_details, args)
     epoch_report = generate_epoch_performance_table(epoch_metrics, class_details[0])
     
@@ -283,6 +293,8 @@ if __name__ == '__main__':
     parser.add_argument("--devices", nargs='+', type=int, default=[0])
     parser.add_argument("--epoch", type=int, default=5) 
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--num_workers", type=int, default=4, help="dataloader workers (reduce if RAM-limited)")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="dataloader prefetch factor (only if num_workers>0)")
     parser.add_argument("--aug_rate", type=float, default=0.0, help="augmentation rate")
 
     parser.add_argument("--datasets_root_dir", type=str, default=f"{DATASETS_ROOT}")

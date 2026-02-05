@@ -159,9 +159,19 @@ def train(args):
     g = torch.Generator()
     g.manual_seed(args.seed)
     # train_dataloader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True) # More basic for FPS comparison
-    train_dataloader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, 
-                                               num_workers=16, pin_memory=True, prefetch_factor=2,
-                                               generator=g, worker_init_fn=seed_worker)  # Faster
+    num_workers = int(getattr(args, "num_workers", 4))
+    prefetch_factor = int(getattr(args, "prefetch_factor", 2))
+    dl_kwargs = dict(
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        generator=g,
+        worker_init_fn=seed_worker,
+    )
+    if num_workers > 0:
+        dl_kwargs["prefetch_factor"] = prefetch_factor
+    train_dataloader = DataLoader(train_data, **dl_kwargs)  # Faster (and safer under RAM limits)
     print(f"Length of the dataset: {len(train_data)}")
 
     ##########################################################################################
@@ -372,6 +382,8 @@ if __name__ == '__main__':
     parser.add_argument("--epoch", type=int, default=5, help="epochs")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="learning rate")
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
+    parser.add_argument("--num_workers", type=int, default=4, help="dataloader workers (reduce if RAM-limited)")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="dataloader prefetch factor (only if num_workers>0)")
     parser.add_argument("--aug_rate", type=float, default=0.0, help="augmentation rate")
     parser.add_argument("--vram_reserve_frac", type=float, default=0.0, help="reserve GPU VRAM to this used fraction (0 disables)")
     parser.add_argument("--vram_reserve_gb", type=float, default=0.0, help="reserve GPU VRAM to this used GB (0 disables)")
