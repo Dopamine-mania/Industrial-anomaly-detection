@@ -150,6 +150,36 @@ def _find_latest_checkpoint(save_path: str):
     return best_path, best_epoch
 
 
+def _patch_level_ce_loss(patch_features, text_features, labels, temp: float):
+    """
+    Patch-level CE loss on CLIP patch tokens.
+    - patch_features: Tensor (B, L, C) or list[Tensor(B, L, C)]
+    - text_features: Tensor (B, 2, C) or (1, 2, C)
+    - labels: Tensor (B,)
+    """
+    if patch_features is None:
+        return None
+    if torch.is_tensor(patch_features):
+        patch_list = [patch_features]
+    else:
+        patch_list = list(patch_features)
+    if len(patch_list) == 0:
+        return None
+
+    losses = []
+    for pf in patch_list:
+        if pf is None:
+            continue
+        # logits: (B, L, 2)
+        patch_logits = calc_similarity_logits(pf, text_features, temp=temp)
+        B, L, _ = patch_logits.shape
+        target = labels.view(B, 1).expand(B, L).reshape(-1)
+        losses.append(F.cross_entropy(patch_logits.reshape(B * L, -1), target))
+    if not losses:
+        return None
+    return torch.stack(losses).mean()
+
+
 def train(args):
     logger = get_logger(args.save_path)
 
@@ -253,12 +283,10 @@ def train(args):
                     patch_features = patch_features.permute(1, 0, *range(2, patch_features.dim())) # 4, N, L, C
                 else:
                     image = items['img'].to(device)
-                    # Fast Bayes-PFL-aligned training: avoid dense patch similarity maps (very expensive).
-                    # We only need global image features here.
-                    if getattr(args, "use_bayes_prompt", False) and getattr(args, "bayes_align_official", True):
-                        image_features, patch_features = model.encode_image(image, [], self_cor_attn_layers=20)
-                    else:
-                        image_features, patch_features = model.encode_image(image, args.features_list, self_cor_attn_layers=20)
+                    # Bayes-PFL-aligned training: we still request patch tokens to:
+                    # (1) keep DINO DAttn active (it is computed only for out_layers),
+                    # (2) enable patch-level supervision (spatial constraint).
+                    image_features, patch_features = model.encode_image(image, args.features_list, self_cor_attn_layers=20)
                     # patch_features = torch.stack(patch_features, dim=0) 
                 if frm is not None:
                     image_features = frm(image_features)
@@ -287,6 +315,16 @@ def train(args):
                     image_logits = calc_similarity_logits(image_features, text_features, temp=0.01)
                     ce_img2txt_loss = F.cross_entropy(image_logits, label.long().to(device))
 
+                    patch_ce_temp = float(getattr(args, "bayes_patch_ce_temp", 0.07))
+                    patch_ce_loss = _patch_level_ce_loss(
+                        patch_features,
+                        text_features,
+                        labels=label.long().to(device),
+                        temp=patch_ce_temp,
+                    )
+                    if patch_ce_loss is None:
+                        patch_ce_loss = torch.zeros([], device=device)
+
                     pfl_loss = prompt_learner.bayes_pfl_loss()
                     if pfl_loss is None:
                         pfl_loss = torch.zeros([], device=device)
@@ -294,6 +332,7 @@ def train(args):
                     ls = float(getattr(args, "bayes_img_ce_weight", 0.2)) * ce_img2txt_loss + float(
                         getattr(args, "bayes_pfl_weight", 1.0)
                     ) * pfl_loss
+                    ls = ls + float(getattr(args, "bayes_patch_ce_weight", 1.0)) * patch_ce_loss
 
                     optimizer.zero_grad()
                     ls.backward()
@@ -301,7 +340,7 @@ def train(args):
 
                     loss_list.append((0.0, 0.0, ce_img2txt_loss.item()))
                     batch_tqdm.set_description(
-                        f"ce_fc_ls: {0.0:.3f}, bcd_dice_ls: {0.0:.3f}, ce_img_ls: {ce_img2txt_loss:.3f}"
+                        f"ce_fc_ls: {0.0:.3f}, bcd_dice_ls: {0.0:.3f}, ce_img_ls: {ce_img2txt_loss:.3f}, ce_patch_ls: {patch_ce_loss:.3f}"
                     )
                     continue
 
@@ -424,6 +463,8 @@ if __name__ == '__main__':
     parser.add_argument("--bayes_num_samples_train", type=int, default=1)
     parser.add_argument("--bayes_pfl_weight", type=float, default=1.0)
     parser.add_argument("--bayes_img_ce_weight", type=float, default=0.2)
+    parser.add_argument("--bayes_patch_ce_weight", type=float, default=1.0, help="patch-level CE weight (Bayes aligned training)")
+    parser.add_argument("--bayes_patch_ce_temp", type=float, default=0.07, help="patch-level CE temperature")
 
     # Feature refinement (attention-ish, minimal-risk)
     parser.add_argument("--use_feature_refinement_module", type=str2bool, default=False)
