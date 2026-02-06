@@ -31,6 +31,8 @@ export CRANE_DATASETS_ROOT="${CRANE_DATASETS_ROOT:-/home/jovyan/data}"
 export EPOCHS="${EPOCHS:-30}"
 
 TRAIN_BATCH="${TRAIN_BATCH:-80}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 LR="${LR:-5e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-6}"
 IMG_CE_W="${IMG_CE_W:-0}"
@@ -51,8 +53,8 @@ TRAIN_EXTRA=(
   --bayes_pfl_weight "${PFL_W}"
   --dino_model dinov2
   --batch_size "${TRAIN_BATCH}"
-  --num_workers 4
-  --prefetch_factor 2
+  --num_workers "${NUM_WORKERS}"
+  --prefetch_factor "${PREFETCH_FACTOR}"
   --vram_reserve_frac 0
 )
 if [[ -n "${RESUME_PATH}" ]]; then
@@ -65,8 +67,8 @@ TEST_EXTRA=(
   --bayes_num_samples 8
   --dino_model dinov2
   --batch_size 32
-  --num_workers 4
-  --prefetch_factor 2
+  --num_workers "${NUM_WORKERS}"
+  --prefetch_factor "${PREFETCH_FACTOR}"
 )
 
 bash "${ROOT_DIR}/experiments/run_cross_domain.sh" "${TAG}" "${DEVICE}" \
@@ -86,7 +88,6 @@ python3 test.py \
   --bayes_num_samples 8 \
   --train_with_img_cls_prob 0 \
   --batch_size 32 \
-  --num_workers 4 \
-  --prefetch_factor 2 \
+  --num_workers "${NUM_WORKERS}" \
+  --prefetch_factor "${PREFETCH_FACTOR}" \
   --visualize True
-
