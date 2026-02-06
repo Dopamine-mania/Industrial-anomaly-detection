@@ -8,6 +8,7 @@ checkpoints/
 results/
 main/Crane-main/results/
 main/Crane-main/checkpoints/
+main/Crane-main/vis_img/
 main/Crane-main/data/
 *.pth
 

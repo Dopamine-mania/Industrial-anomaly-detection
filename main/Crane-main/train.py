@@ -257,7 +257,12 @@ def train(args):
     params = list(prompt_learner.parameters())
     if frm is not None:
         params += list(frm.parameters())
-    optimizer = torch.optim.Adam(params, lr=args.learning_rate, betas=(0.6, 0.999))
+    optimizer = torch.optim.Adam(
+        params,
+        lr=args.learning_rate,
+        betas=(0.6, 0.999),
+        weight_decay=float(getattr(args, "weight_decay", 0.0)),
+    )
     
     precompute = False
     if precompute:
@@ -424,6 +429,7 @@ if __name__ == '__main__':
     parser.add_argument("--device", type=int, default=0, help="cuda device")
     parser.add_argument("--epoch", type=int, default=5, help="epochs")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="Adam weight decay")
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="dataloader workers (reduce if RAM-limited)")
     parser.add_argument("--prefetch_factor", type=int, default=2, help="dataloader prefetch factor (only if num_workers>0)")
