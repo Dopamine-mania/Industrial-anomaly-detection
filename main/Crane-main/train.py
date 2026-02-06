@@ -160,7 +160,11 @@ def _patch_level_ce_loss(patch_features, text_features, labels, temp: float):
     if patch_features is None:
         return None
     if torch.is_tensor(patch_features):
-        patch_list = [patch_features]
+        if patch_features.dim() == 4:
+            # (N_layers, B, L, C)
+            patch_list = [patch_features[i] for i in range(patch_features.shape[0])]
+        else:
+            patch_list = [patch_features]
     else:
         patch_list = list(patch_features)
     if len(patch_list) == 0:
