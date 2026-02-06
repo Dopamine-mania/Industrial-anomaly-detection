@@ -37,6 +37,7 @@ bash "${ROOT_DIR}/experiments/run_cross_domain.sh" "${TAG}" "${DEVICE}" \
     --bayes_pfl_weight 1.0 \
     --dino_model dinov2 \
     --batch_size 64 \
+    --vram_reserve_frac 0.8 \
     --num_workers 4 \
     --prefetch_factor 2 \
   --test \
@@ -65,4 +66,3 @@ python3 test.py \
   --num_workers 4 \
   --prefetch_factor 2 \
   --visualize True
-
