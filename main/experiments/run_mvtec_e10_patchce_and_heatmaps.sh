@@ -21,6 +21,8 @@ CRANE_DIR="${ROOT_DIR}/Crane-main"
 
 EPOCHS="${EPOCHS:-10}"
 export CRANE_DATASETS_ROOT="${CRANE_DATASETS_ROOT:-/home/jovyan/data}"
+TRAIN_BATCH="${TRAIN_BATCH:-64}"
+VRAM_RESERVE_FRAC="${VRAM_RESERVE_FRAC:-0}"
 
 export STOP_AFTER_MVTEC_EVAL=1
 export EPOCHS
@@ -35,9 +37,9 @@ bash "${ROOT_DIR}/experiments/run_cross_domain.sh" "${TAG}" "${DEVICE}" \
     --bayes_img_ce_weight 0.2 \
     --bayes_patch_ce_weight 1.0 \
     --bayes_pfl_weight 1.0 \
-    --dino_model dinov2 \
-    --batch_size 64 \
-    --vram_reserve_frac 0.8 \
+  --dino_model dinov2 \
+  --batch_size "${TRAIN_BATCH}" \
+    --vram_reserve_frac "${VRAM_RESERVE_FRAC}" \
     --num_workers 4 \
     --prefetch_factor 2 \
   --test \
