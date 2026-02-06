@@ -24,6 +24,7 @@ import os
 import argparse
 import subprocess
 import math
+import re
 
 from tqdm import tqdm
 
@@ -245,13 +246,21 @@ def train(args):
         ckpt_epoch = 0
         if ckpt_path is None:
             ckpt_path, ckpt_epoch = _find_latest_checkpoint(args.save_path)
-        if ckpt_path is not None and ckpt_epoch > 0:
+        else:
+            ckpt_path = os.path.abspath(ckpt_path)
+            m = re.search(r"epoch_(\d+)\.pth$", os.path.basename(ckpt_path))
+            if m:
+                ckpt_epoch = int(m.group(1))
+            else:
+                ckpt_epoch = int(getattr(args, "resume_epoch", 0) or 0)
+
+        if ckpt_path is not None and os.path.isfile(ckpt_path):
             checkpoint = torch.load(ckpt_path, map_location="cpu")
             prompt_learner.load_state_dict(checkpoint["prompt_learner"], strict=True)
             if frm is not None and "feature_refinement_module" in checkpoint:
                 frm.load_state_dict(checkpoint["feature_refinement_module"], strict=True)
-            start_epoch = ckpt_epoch
-            logger.info(f"Auto-resume from {ckpt_path} (epoch {ckpt_epoch})")
+            start_epoch = max(0, ckpt_epoch)
+            logger.info(f"Auto-resume from {ckpt_path} (epoch {start_epoch})")
 
     ##########################################################################################
     params = list(prompt_learner.parameters())
@@ -440,6 +449,7 @@ if __name__ == '__main__':
     parser.add_argument("--train_good_only", type=str2bool, default=True, help="train split normal-only (anti-leakage)")
     parser.add_argument("--auto_resume", type=str2bool, default=True, help="auto resume from latest checkpoint")
     parser.add_argument("--resume_path", type=str, default=None, help="explicit checkpoint path to resume from")
+    parser.add_argument("--resume_epoch", type=int, default=0, help="used if resume_path has no epoch_XX suffix")
 
     parser.add_argument("--dataset", type=str, nargs="+", default=[f'{ds}' for ds in dss], help="train dataset name")
     parser.add_argument("--target_class", type=str, default=None, help="optional: restrict to specific class (e.g. bottle)")
