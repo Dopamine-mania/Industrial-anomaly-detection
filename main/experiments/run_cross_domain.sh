@@ -61,20 +61,20 @@ TEST_COMMON=(
   --visualize False
 )
 
-python3 train.py --dataset mvtec --model_name "${TAG}" "${TRAIN_COMMON[@]}" "${TRAIN_EXTRA[@]}"
+python3 -u train.py --dataset mvtec --model_name "${TAG}" "${TRAIN_COMMON[@]}" "${TRAIN_EXTRA[@]}"
 
 # In-domain eval on mvtec (after mvtec training)
-python3 test.py --dataset mvtec --model_name "trained_on_mvtec_${TAG}" "${TEST_COMMON[@]}" "${TEST_EXTRA[@]}"
+python3 -u test.py --dataset mvtec --model_name "trained_on_mvtec_${TAG}" "${TEST_COMMON[@]}" "${TEST_EXTRA[@]}"
 
 if [[ "${STOP_AFTER_MVTEC_EVAL:-0}" == "1" ]]; then
   echo "STOP_AFTER_MVTEC_EVAL=1 set; stopping after mvtec in-domain eval."
   exit 0
 fi
 
-python3 train.py --dataset visa  --model_name "${TAG}" "${TRAIN_COMMON[@]}" "${TRAIN_EXTRA[@]}"
+python3 -u train.py --dataset visa  --model_name "${TAG}" "${TRAIN_COMMON[@]}" "${TRAIN_EXTRA[@]}"
 
 # In-domain eval on visa (after visa training)
-python3 test.py --dataset visa  --model_name "trained_on_visa_${TAG}" "${TEST_COMMON[@]}" "${TEST_EXTRA[@]}"
+python3 -u test.py --dataset visa  --model_name "trained_on_visa_${TAG}" "${TEST_COMMON[@]}" "${TEST_EXTRA[@]}"
 
-python3 test.py --dataset visa  --model_name "trained_on_mvtec_${TAG}" "${TEST_COMMON[@]}" "${TEST_EXTRA[@]}"
-python3 test.py --dataset mvtec --model_name "trained_on_visa_${TAG}"  "${TEST_COMMON[@]}" "${TEST_EXTRA[@]}"
+python3 -u test.py --dataset visa  --model_name "trained_on_mvtec_${TAG}" "${TEST_COMMON[@]}" "${TEST_EXTRA[@]}"
+python3 -u test.py --dataset mvtec --model_name "trained_on_visa_${TAG}"  "${TEST_COMMON[@]}" "${TEST_EXTRA[@]}"
