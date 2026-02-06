@@ -393,6 +393,7 @@ if __name__ == '__main__':
     parser.add_argument("--resume_path", type=str, default=None, help="explicit checkpoint path to resume from")
 
     parser.add_argument("--dataset", type=str, nargs="+", default=[f'{ds}' for ds in dss], help="train dataset name")
+    parser.add_argument("--target_class", type=str, default=None, help="optional: restrict to specific class (e.g. bottle)")
     parser.add_argument("--k_shot", type=int, default=0, help="samples per class for few-shot learning. 0 means use all data.")
     parser.add_argument("--portion", type=float, default=1) 
 

@@ -145,6 +145,10 @@ class ScoreCalculator(nn.Module):
         image_pred = image_logits.softmax(dim=-1)
         anomaly_score = image_pred[:, 1].detach()
 
+        if getattr(self.args, "invert_scores", False):
+            anomaly_score = 1.0 - anomaly_score
+            anomaly_map = 1.0 - anomaly_map
+
         return anomaly_score, anomaly_map 
 
 def compute_metrics_for_object(obj, dataset_results):
@@ -172,15 +176,17 @@ def compute_metrics_for_object(obj, dataset_results):
 def process_dataset(model, dataloader, class_details, args): 
     Crane_parameters = {"Prompt_length": args.n_ctx, "learnabel_text_embedding_depth": args.depth, "learnabel_text_embedding_length": args.t_n_ctx, 'others': args}
     prompt_learner = PromptLearner(model, Crane_parameters)
-    checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
-    missing_keys, unexpected_keys = prompt_learner.load_state_dict(checkpoint["prompt_learner"], strict=True)
-    assert len(missing_keys) == 0, f"Missing keys in state dict: {missing_keys}"
-    assert len(unexpected_keys) == 0, f"Unexpected keys in state dict: {unexpected_keys}"
+    checkpoint = None
+    if not getattr(args, "skip_checkpoint_load", False):
+        checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
+        missing_keys, unexpected_keys = prompt_learner.load_state_dict(checkpoint["prompt_learner"], strict=True)
+        assert len(missing_keys) == 0, f"Missing keys in state dict: {missing_keys}"
+        assert len(unexpected_keys) == 0, f"Unexpected keys in state dict: {unexpected_keys}"
     prompt_learner = prompt_learner.cuda()
     
     score_base_pooling = Crane.ScoreBasePooling()
     frm = None
-    if "feature_refinement_module" in checkpoint:
+    if checkpoint is not None and "feature_refinement_module" in checkpoint:
         dim = model.ln_final.weight.shape[0]
         frm = FeatureRefinementModule(
             dim=dim,
@@ -288,6 +294,8 @@ if __name__ == '__main__':
     parser.add_argument("--model_name", type=str, default="trained_on_mvtec_default", help="model_name")
     parser.add_argument("--seed", type=int, default=111, help="random seed")
     parser.add_argument("--visualize", type=str2bool, default=False)
+    parser.add_argument("--invert_scores", type=str2bool, default=False, help="debug: invert anomaly scores/maps")
+    parser.add_argument("--skip_checkpoint_load", type=str2bool, default=False, help="debug: evaluate with fresh PromptLearner init")
     
     parser.add_argument("--type", type=str, default='test') 
     parser.add_argument("--devices", nargs='+', type=int, default=[0])
@@ -296,9 +304,11 @@ if __name__ == '__main__':
     parser.add_argument("--num_workers", type=int, default=4, help="dataloader workers (reduce if RAM-limited)")
     parser.add_argument("--prefetch_factor", type=int, default=2, help="dataloader prefetch factor (only if num_workers>0)")
     parser.add_argument("--aug_rate", type=float, default=0.0, help="augmentation rate")
+    parser.add_argument("--checkpoint_path", type=str, default=None, help="optional explicit checkpoint path")
 
     parser.add_argument("--datasets_root_dir", type=str, default=f"{DATASETS_ROOT}")
     parser.add_argument("--dataset", type=str, default="mvtec")
+    parser.add_argument("--target_class", type=str, default=None, help="optional: restrict to specific class (e.g. bottle)")
     parser.add_argument("--portion", type=float, default=1) # 0.02
     parser.add_argument("--k_shot", type=int, default=0, help="number of samples per class. 0 means use all data.")
 
@@ -345,7 +355,8 @@ if __name__ == '__main__':
         args.log_dir = make_human_readable_name(args)        
         
         args.data_path = [f"{args.datasets_root_dir}/{args.dataset}/"]
-        args.checkpoint_path = f'./checkpoints/{args.model_name}/epoch_{args.epoch}.pth'
+        if args.checkpoint_path is None:
+            args.checkpoint_path = f'./checkpoints/{args.model_name}/epoch_{args.epoch}.pth'
         args.save_path = f'./results/{args.model_name}/test_on_{args.dataset}/'
 
         print(f"Testing on dataset from: {args.data_path}") 

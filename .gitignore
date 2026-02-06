@@ -4,6 +4,8 @@ __pycache__/
 .DS_Store
 
 # Large artifacts / outputs
+checkpoints/
+results/
 main/Crane-main/results/
 main/Crane-main/checkpoints/
 main/Crane-main/data/

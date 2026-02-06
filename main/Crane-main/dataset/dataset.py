@@ -163,6 +163,13 @@ class Dataset(data.Dataset):
         if dataset_split == 'train' and getattr(kwargs, "train_good_only", True):
             for cls_name in list(meta_infos.keys()):
                 meta_infos[cls_name] = [s for s in meta_infos[cls_name] if int(s.get("anomaly", 0)) == 0]
+
+        target_class = getattr(kwargs, "target_class", None)
+        if target_class:
+            target_set = {c.strip() for c in str(target_class).split(",") if c.strip()}
+            meta_infos = {k: v for k, v in meta_infos.items() if k in target_set}
+            if not meta_infos:
+                raise ValueError(f"target_class={target_class!r} not found in meta.json classes")
         self.cls_names = list(meta_infos.keys())
         
         self.data_all = []
