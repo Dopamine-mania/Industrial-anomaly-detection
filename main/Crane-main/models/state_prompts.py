@@ -12,15 +12,19 @@ NORMAL_STATE_WORDS = [
 # Keep this list centralized so downstream changes are 1-line edits.
 ABNORMAL_STATE_WORDS = [
     "damaged",
+    "damage",
     "broken",
     "defective",
     "flawed",
     "corrupted",
     "scratched",
     "stained",
+    "contamination",
     "contaminated",
     "blemished",
+    "hole",
     "cracked",
+    "crack",
 ]
 
 NORMAL_STATE_TEMPLATES = ["{}"] + [f"{w} {{}}" for w in NORMAL_STATE_WORDS]

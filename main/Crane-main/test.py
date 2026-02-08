@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 import models
 from models import Crane
 from models.prompt_ensemble import PromptLearner
+from models.prompt_ensemble import tokenize as clip_tokenize
 from models.feature_refinement import FeatureRefinementModule
 from dataset.dataset import Dataset
 from __init__ import DATASETS_ROOT
@@ -178,6 +179,65 @@ def _encode_text_features_mc_static(model, prompt_learner, args, device):
         total = tf if total is None else (total + tf)
     return total / float(n_samples)
 
+def _encode_text_prompt_banks_fixed(model, class_name: str, device: str = "cuda"):
+    """
+    WinCLIP-style fixed prompts: encode normal/abnormal prompt banks.
+    Returns:
+      tf_pos_bank: (P, C) normalized
+      tf_neg_bank: (Q, C) normalized
+    """
+    from models.state_prompts import NORMAL_STATE_TEMPLATES, ABNORMAL_STATE_TEMPLATES
+
+    prompts_pos = [t.format(class_name) for t in NORMAL_STATE_TEMPLATES]
+    prompts_neg = [t.format(class_name) for t in ABNORMAL_STATE_TEMPLATES]
+    tokens_pos = clip_tokenize(prompts_pos).to(device=device)
+    tokens_neg = clip_tokenize(prompts_neg).to(device=device)
+
+    # NOTE: Crane's text Transformer uses ResidualAttentionBlock_learnable_token blocks, which expect
+    # list inputs. `encode_text()` (standard CLIP path) will fail due to this architectural change.
+    # We therefore reuse `encode_text_learn()` with an empty deep prompt list to emulate standard CLIP.
+    cast_dtype = model.transformer.get_cast_dtype()
+    with torch.no_grad():
+        emb_pos = model.token_embedding(tokens_pos).type(cast_dtype)
+        emb_neg = model.token_embedding(tokens_neg).type(cast_dtype)
+
+        tf_pos = model.encode_text_learn(emb_pos, tokens_pos, deep_compound_prompts_text=[]).float()
+        tf_neg = model.encode_text_learn(emb_neg, tokens_neg, deep_compound_prompts_text=[]).float()
+        tf_pos = F.normalize(tf_pos, dim=-1)
+        tf_neg = F.normalize(tf_neg, dim=-1)
+    return tf_pos, tf_neg
+
+
+def _reduce_prompt_scores(scores: torch.Tensor, mode: str):
+    if mode == "max":
+        return scores.max(dim=-1).values
+    if mode == "mean":
+        return scores.mean(dim=-1)
+    if mode == "logsumexp":
+        return torch.logsumexp(scores, dim=-1)
+    raise ValueError(f"Unknown fixed_prompts_reduce={mode!r}")
+
+
+def _fixed_prompt_logits(features: torch.Tensor, tf_pos: torch.Tensor, tf_neg: torch.Tensor, temp: float, reduce: str):
+    """
+    features: (B,C) or (B,L,C)
+    tf_pos/tf_neg: (P,C)/(Q,C)
+    returns logits: (B,2) or (B,L,2)
+    """
+    if features.dim() == 2:
+        pos = (features @ tf_pos.t()) / float(temp)
+        neg = (features @ tf_neg.t()) / float(temp)
+        pos_r = _reduce_prompt_scores(pos, reduce)
+        neg_r = _reduce_prompt_scores(neg, reduce)
+        return torch.stack([pos_r, neg_r], dim=-1)
+    if features.dim() == 3:
+        pos = torch.einsum("blc,pc->blp", features, tf_pos) / float(temp)
+        neg = torch.einsum("blc,qc->blq", features, tf_neg) / float(temp)
+        pos_r = _reduce_prompt_scores(pos, reduce)
+        neg_r = _reduce_prompt_scores(neg, reduce)
+        return torch.stack([pos_r, neg_r], dim=-1)
+    raise ValueError(f"Unexpected features.dim()={features.dim()}")
+
 class ScoreCalculator(nn.Module):
     def __init__(self, base_model, class_details, args,
                  prompt_learner, score_base_pooling, feature_refinement_module=None):
@@ -190,6 +250,8 @@ class ScoreCalculator(nn.Module):
         self.sbp = score_base_pooling
         self.frm = feature_refinement_module
         self._cached_text = {}
+        self.fixed_tf_pos_bank = None
+        self.fixed_tf_neg_bank = None
 
     def forward(self, image):
         with torch.no_grad():
@@ -269,7 +331,10 @@ class ScoreCalculator(nn.Module):
         # image_features = F.normalize(image_features, dim=-1)
         # patch_features = F.normalize(patch_features, dim=-1)
         
-        if getattr(self.args, "use_bayes_prompt", False) and getattr(self.args, "bayes_condition_on_image", True):
+        fixed_prompts = bool(getattr(self.args, "fixed_prompts", False))
+        if fixed_prompts:
+            text_features = None
+        elif getattr(self.args, "use_bayes_prompt", False) and getattr(self.args, "bayes_condition_on_image", True):
             text_features = _encode_text_features_mc(self.model, self.prompt_learner, image_features, self.args)
         elif self.args.train_with_img_cls_prob != 0:
             text_features = _encode_text_features_mc(self.model, self.prompt_learner, image_features, self.args)
@@ -279,8 +344,18 @@ class ScoreCalculator(nn.Module):
         # Similarity Map - Segmentation
         #########################################################################
         pixel_logits_list = []
+        fixed_reduce = str(getattr(self.args, "fixed_prompts_reduce", "max"))
         for patch_feature in patch_features:
-            pixel_logits = calc_similarity_logits(patch_feature, text_features)
+            if fixed_prompts:
+                pixel_logits = _fixed_prompt_logits(
+                    patch_feature,
+                    self.fixed_tf_pos_bank,
+                    self.fixed_tf_neg_bank,
+                    temp=0.07,
+                    reduce=fixed_reduce,
+                )
+            else:
+                pixel_logits = calc_similarity_logits(patch_feature, text_features)
             pixel_logits_list.append(pixel_logits)
 
         if self.args.soft_mean:    
@@ -300,7 +375,16 @@ class ScoreCalculator(nn.Module):
             image_features = alpha * clustered_feature + (1 - alpha) * image_features
             image_features = F.normalize(image_features, dim=1)
 
-        image_logits = calc_similarity_logits(image_features, text_features)
+        if fixed_prompts:
+            image_logits = _fixed_prompt_logits(
+                image_features,
+                self.fixed_tf_pos_bank,
+                self.fixed_tf_neg_bank,
+                temp=0.07,
+                reduce=fixed_reduce,
+            )
+        else:
+            image_logits = calc_similarity_logits(image_features, text_features)
         image_pred = image_logits.softmax(dim=-1)
         anomaly_score = image_pred[:, 1].detach()
 
@@ -363,8 +447,19 @@ def process_dataset(model, dataloader, class_details, args):
         score_base_pooling=score_base_pooling,
         feature_refinement_module=frm,
     )
-    
-    if args.train_with_img_cls_prob == 0 and not (getattr(args, "use_bayes_prompt", False) and getattr(args, "bayes_condition_on_image", True)):
+
+    if getattr(args, "fixed_prompts", False):
+        # Pick class name: if evaluating a single class, prefer that for prompt semantics.
+        class_name = "object"
+        if getattr(args, "fixed_prompt_classname", None):
+            class_name = str(args.fixed_prompt_classname)
+        elif getattr(args, "target_class", None) and "," not in str(args.target_class):
+            class_name = str(args.target_class).strip()
+        with torch.no_grad():
+            tf_pos, tf_neg = _encode_text_prompt_banks_fixed(model, class_name, device="cuda")
+            score_calc.fixed_tf_pos_bank = tf_pos
+            score_calc.fixed_tf_neg_bank = tf_neg
+    elif args.train_with_img_cls_prob == 0 and not (getattr(args, "use_bayes_prompt", False) and getattr(args, "bayes_condition_on_image", True)):
         with torch.no_grad():
             text_features = _encode_text_features_mc_static(model, prompt_learner, args, device="cuda")
         score_calc.text_features = text_features
@@ -538,6 +633,9 @@ if __name__ == '__main__':
     )
     parser.add_argument("--aug_rate", type=float, default=0.0, help="augmentation rate")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="optional explicit checkpoint path")
+    parser.add_argument("--fixed_prompts", type=str2bool, default=False, help="use fixed WinCLIP-style state prompts (no learnable prompt tokens)")
+    parser.add_argument("--fixed_prompt_classname", type=str, default=None, help="override class name used in fixed prompts (defaults to target_class if single class)")
+    parser.add_argument("--fixed_prompts_reduce", type=str, choices=["max", "mean", "logsumexp"], default="max", help="reduction over fixed prompt bank")
 
     parser.add_argument("--datasets_root_dir", type=str, default=f"{DATASETS_ROOT}")
     parser.add_argument("--dataset", type=str, default="mvtec")
