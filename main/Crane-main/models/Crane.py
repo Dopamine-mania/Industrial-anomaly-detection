@@ -554,19 +554,33 @@ class Crane(nn.Module):
 
 
     # 7.2 图像编码器[VFM+ViT]
-    def encode_image(self, image, feature_list = [], self_cor_attn_layers = None):
+    def encode_image(
+        self,
+        image,
+        feature_list = [],
+        self_cor_attn_layers = None,
+        vfm_num_layers: int = 1,
+        return_vfm_feats: bool = False,
+    ):
         dino_feats = None
+        vfm_feats_list = None
         if self.vfm:
             raw_img = unnormalize(image, OPENAI_DATASET_MEAN, OPENAI_DATASET_STD)
             dino_img = Normalize(IMAGENET_DATASET_MEAN, IMAGENET_DATASET_STD)(raw_img)
 
             if self.vfm_model == 'dino':
-                feat = self.vfm.get_intermediate_layers(dino_img)[0]
-                t_l = self.image_resolution//self.vfm_patch_size 
-                dino_feats = feat[:, 1:, :].reshape(-1, t_l, t_l, feat.shape[2]).permute(0, 3, 1, 2)
+                feats = self.vfm.get_intermediate_layers(dino_img, n=int(vfm_num_layers))
+                vfm_feats_list = []
+                t_l = self.image_resolution//self.vfm_patch_size
+                for feat in feats:
+                    vfm_feats_list.append(feat[:, 1:, :].reshape(-1, t_l, t_l, feat.shape[2]).permute(0, 3, 1, 2))
+                if len(vfm_feats_list) > 0:
+                    dino_feats = vfm_feats_list[-1]
             
             elif self.vfm_model == 'dinov2':
-                dino_feats = self.vfm.get_intermediate_layers(dino_img, reshape=True)[0]
+                vfm_feats_list = self.vfm.get_intermediate_layers(dino_img, n=int(vfm_num_layers), reshape=True)
+                if len(vfm_feats_list) > 0:
+                    dino_feats = vfm_feats_list[-1]
 
             elif self.vfm_model == 'sam':
                 patch_size = self.vfm.image_encoder.patch_embed.proj.kernel_size
@@ -575,6 +589,8 @@ class Crane(nn.Module):
                 dino_feats = self.vfm.image_encoder(imgs_norm) # [B, 256, 64, 64]
 
         image_features, patch_features = self.visual(image.type(self.dtype), feature_list, dino_feats=dino_feats, self_cor_attn_layers=self_cor_attn_layers)
+        if return_vfm_feats:
+            return image_features, patch_features, vfm_feats_list
         return image_features, patch_features
 
 

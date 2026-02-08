@@ -45,20 +45,29 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CRANE_DIR="${ROOT_DIR}/Crane-main"
 
 EPOCHS="${EPOCHS:-5}"
+DATASETS_ROOT_DIR="${CRANE_DATASETS_ROOT:-${DATASETS_ROOT_DIR:-/home/jovyan/data}}"
+
+# Avoid Crane's internal "respawn with CUDA_VISIBLE_DEVICES" logic, which drops `-u` and
+# can mis-handle non-zero device ids. We pin the physical GPU here and always use cuda:0
+# inside the python processes.
+export CUDA_VISIBLE_DEVICES="${DEVICE}"
+INTERNAL_DEVICE_ID=0
 
 cd "${CRANE_DIR}"
 
 TRAIN_COMMON=(
-  --device "${DEVICE}"
+  --device "${INTERNAL_DEVICE_ID}"
   --epoch "${EPOCHS}"
   --save_freq 1
   --train_good_only True
+  --datasets_root_dir "${DATASETS_ROOT_DIR}"
 )
 
 TEST_COMMON=(
-  --devices "${DEVICE}"
+  --devices "${INTERNAL_DEVICE_ID}"
   --epoch "${EPOCHS}"
   --visualize False
+  --datasets_root_dir "${DATASETS_ROOT_DIR}"
 )
 
 python3 -u train.py --dataset mvtec --model_name "${TAG}" "${TRAIN_COMMON[@]}" "${TRAIN_EXTRA[@]}"

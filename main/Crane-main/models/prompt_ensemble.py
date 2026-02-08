@@ -105,8 +105,35 @@ class PromptLearner(nn.Module):
         ### 初始化 浅层可学习提示
         ctx_vectors_pos = torch.empty(self.n_cls, self.normal_num, self.n_ctx_pos, ctx_dim, dtype=dtype)
         ctx_vectors_neg = torch.empty(self.n_cls, self.anormaly_num, self.n_ctx_pos, ctx_dim, dtype=dtype)
-        nn.init.normal_(ctx_vectors_pos, std=0.02)
-        nn.init.normal_(ctx_vectors_neg, std=0.02)
+        ctx_init = str(getattr(args, "ctx_init", "random"))
+        if ctx_init == "zeros":
+            nn.init.zeros_(ctx_vectors_pos)
+            nn.init.zeros_(ctx_vectors_neg)
+        elif ctx_init == "clip":
+            phrase = str(getattr(args, "ctx_init_phrase", "a photo of a"))
+            token_device = clip_model.token_embedding.weight.device
+            tokenized = tokenize(phrase).to(device=token_device)
+            with torch.no_grad():
+                emb = clip_model.token_embedding(tokenized).type(dtype)  # (1, 77, C)
+
+            # Extract "content" token embeddings between SOT and EOT.
+            eot_token = _tokenizer.encoder["<|endoftext|>"]
+            eot_pos = int((tokenized[0] == eot_token).nonzero(as_tuple=False)[0].item())
+            content = emb[0, 1:eot_pos, :]  # (T, C)
+            if content.numel() == 0:
+                nn.init.normal_(ctx_vectors_pos, std=0.02)
+                nn.init.normal_(ctx_vectors_neg, std=0.02)
+            else:
+                # Tile/pad to n_ctx.
+                rep = int(math.ceil(float(self.n_ctx_pos) / float(content.shape[0])))
+                base = content.repeat(rep, 1)[: self.n_ctx_pos, :]  # (n_ctx, C)
+                base_pos = base.view(1, 1, self.n_ctx_pos, ctx_dim)
+                ctx_vectors_pos.copy_(base_pos.expand(self.n_cls, self.normal_num, -1, -1))
+                base_neg = base.view(1, 1, self.n_ctx_neg, ctx_dim)
+                ctx_vectors_neg.copy_(base_neg.expand(self.n_cls, self.anormaly_num, -1, -1))
+        else:
+            nn.init.normal_(ctx_vectors_pos, std=0.02)
+            nn.init.normal_(ctx_vectors_neg, std=0.02)
         self.ctx_pos = nn.Parameter(ctx_vectors_pos)  # to be optimized
         self.ctx_neg = nn.Parameter(ctx_vectors_neg)  # to be optimized
 
@@ -118,6 +145,13 @@ class PromptLearner(nn.Module):
             init_logstd = float(getattr(args, "bayes_init_logstd", math.log(0.02)))
             self.ctx_pos_logstd = nn.Parameter(torch.full_like(self.ctx_pos, init_logstd))
             self.ctx_neg_logstd = nn.Parameter(torch.full_like(self.ctx_neg, init_logstd))
+
+            # Residual gate: keep stochastic Bayes prompt as a small "delta" on top of
+            # the deterministic (conditioned) mean to avoid destroying CLIP's manifold.
+            self.bayes_use_residual = bool(getattr(args, "bayes_use_residual", True))
+            alpha_init = float(getattr(args, "bayes_residual_alpha_init", 0.01))
+            self.bayes_residual_alpha_pos = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+            self.bayes_residual_alpha_neg = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
 
             ctx_dim = clip_model.ln_final.weight.shape[0]
             self.ctx_cond_pos = nn.Linear(ctx_dim, ctx_dim, bias=True)
@@ -284,7 +318,7 @@ class PromptLearner(nn.Module):
         zk_a = zk_a.to(device=img_emb.device, dtype=img_emb.dtype)
         return zk, (zk_n, zk_a)
 
-    def _bayes_sample_ctx(self, ctx_mean, ctx_logstd, img_emb, cond_proj, shift_vec=None):
+    def _bayes_sample_ctx(self, ctx_mean, ctx_logstd, img_emb, cond_proj, shift_vec=None, alpha_param=None):
         # Expand logstd to match ctx_mean shape
         logstd = ctx_logstd
         if ctx_mean.dim() == 5 and logstd.dim() == 4:
@@ -333,6 +367,11 @@ class PromptLearner(nn.Module):
         else:
             for layer in getattr(self, "prompt_flow", []):
                 ctx = ctx + torch.tanh(layer(ctx))
+
+        # Residual-gated update: ctx = mean + alpha * (ctx - mean)
+        if alpha_param is not None and bool(getattr(self, "bayes_use_residual", False)):
+            alpha = torch.clamp(alpha_param.to(dtype=mean.dtype, device=mean.device), 0.0, 1.0)
+            ctx = mean + alpha * (ctx - mean)
 
         # KL(N(mean, std) || N(0, 1))
         kl = 0.5 * (mean.pow(2) + std.pow(2) - 1.0 - 2.0 * logstd).mean()
@@ -407,14 +446,36 @@ class PromptLearner(nn.Module):
                     shift_pos = shift_ctx + shift_n.expand_as(shift_ctx)
                     shift_neg = shift_ctx + shift_a.expand_as(shift_ctx)
                     ctx_pos, kl_pos = self._bayes_sample_ctx(
-                        ctx_pos, self.ctx_pos_logstd, img_emb, self.ctx_cond_pos, shift_vec=shift_pos
+                        ctx_pos,
+                        self.ctx_pos_logstd,
+                        img_emb,
+                        self.ctx_cond_pos,
+                        shift_vec=shift_pos,
+                        alpha_param=self.bayes_residual_alpha_pos if self.bayes_use_residual else None,
                     )
                     ctx_neg, kl_neg = self._bayes_sample_ctx(
-                        ctx_neg, self.ctx_neg_logstd, img_emb, self.ctx_cond_neg, shift_vec=shift_neg
+                        ctx_neg,
+                        self.ctx_neg_logstd,
+                        img_emb,
+                        self.ctx_cond_neg,
+                        shift_vec=shift_neg,
+                        alpha_param=self.bayes_residual_alpha_neg if self.bayes_use_residual else None,
                     )
                 else:
-                    ctx_pos, kl_pos = self._bayes_sample_ctx(ctx_pos, self.ctx_pos_logstd, img_emb, self.ctx_cond_pos)
-                    ctx_neg, kl_neg = self._bayes_sample_ctx(ctx_neg, self.ctx_neg_logstd, img_emb, self.ctx_cond_neg)
+                    ctx_pos, kl_pos = self._bayes_sample_ctx(
+                        ctx_pos,
+                        self.ctx_pos_logstd,
+                        img_emb,
+                        self.ctx_cond_pos,
+                        alpha_param=self.bayes_residual_alpha_pos if self.bayes_use_residual else None,
+                    )
+                    ctx_neg, kl_neg = self._bayes_sample_ctx(
+                        ctx_neg,
+                        self.ctx_neg_logstd,
+                        img_emb,
+                        self.ctx_cond_neg,
+                        alpha_param=self.bayes_residual_alpha_neg if self.bayes_use_residual else None,
+                    )
                 self._last_kl = kl_pos + kl_neg
             else:
                 self._last_kl = None
@@ -452,8 +513,20 @@ class PromptLearner(nn.Module):
             ctx_neg = self.ctx_neg
 
             if self.use_bayes_prompt:
-                ctx_pos, kl_pos = self._bayes_sample_ctx(ctx_pos, self.ctx_pos_logstd, None, self.ctx_cond_pos)
-                ctx_neg, kl_neg = self._bayes_sample_ctx(ctx_neg, self.ctx_neg_logstd, None, self.ctx_cond_neg)
+                ctx_pos, kl_pos = self._bayes_sample_ctx(
+                    ctx_pos,
+                    self.ctx_pos_logstd,
+                    None,
+                    self.ctx_cond_pos,
+                    alpha_param=self.bayes_residual_alpha_pos if self.bayes_use_residual else None,
+                )
+                ctx_neg, kl_neg = self._bayes_sample_ctx(
+                    ctx_neg,
+                    self.ctx_neg_logstd,
+                    None,
+                    self.ctx_cond_neg,
+                    alpha_param=self.bayes_residual_alpha_neg if self.bayes_use_residual else None,
+                )
                 self._last_kl = kl_pos + kl_neg
             else:
                 self._last_kl = None

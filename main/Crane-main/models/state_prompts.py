@@ -1,4 +1,6 @@
 NORMAL_STATE_WORDS = [
+    # neutral (no state adjective) is a strong positive prior in CLIP ZSAD
+    # and helps prevent "abnormal always wins" similarity collapse.
     "good",
     "normal",
     "perfect",
@@ -21,6 +23,5 @@ ABNORMAL_STATE_WORDS = [
     "cracked",
 ]
 
-NORMAL_STATE_TEMPLATES = [f"{w} {{}}" for w in NORMAL_STATE_WORDS]
+NORMAL_STATE_TEMPLATES = ["{}"] + [f"{w} {{}}" for w in NORMAL_STATE_WORDS]
 ABNORMAL_STATE_TEMPLATES = [f"{w} {{}}" for w in ABNORMAL_STATE_WORDS]
-

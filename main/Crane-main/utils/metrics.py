@@ -33,15 +33,23 @@ def cal_pro_score(masks, amaps, max_step=200, expect_fpr=0.3):
     return pro_auc
 
 def calc_f1_max(gt, pr):
-    precisions, recalls, _ = precision_recall_curve(gt, pr)
-    f1_scores = (2 * precisions * recalls) / (precisions + recalls)
-    return np.max(f1_scores[np.isfinite(f1_scores)])
+    if torch.is_tensor(gt):
+        gt = gt.detach().cpu().numpy()
+    if torch.is_tensor(pr):
+        pr = pr.detach().cpu().numpy()
+    gt = np.asarray(gt).ravel()
+    pr = np.asarray(pr).ravel()
 
-# without warning for division by zero
-# denom = precisions + recalls
-# f1_scores = np.zeros_like(denom)
-# valid = denom > 0
-# f1_scores[valid] = (2 * precisions[valid] * recalls[valid]) / denom[valid]
+    precisions, recalls, _ = precision_recall_curve(gt, pr)
+    denom = precisions + recalls
+    f1_scores = np.zeros_like(denom, dtype=np.float64)
+    valid = denom > 0
+    if np.any(valid):
+        f1_scores[valid] = (2 * precisions[valid] * recalls[valid]) / denom[valid]
+        return float(np.max(f1_scores))
+    return 0.0
+
+# Note: when denom==0, precision and recall are both 0, and F1 is defined as 0.
 
 def image_level_metrics(results, obj, metric):
     gt = results[obj]['gt_sp']

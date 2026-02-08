@@ -15,6 +15,7 @@ from utils.visualization import visualizer
 from utils.metrics import image_level_metrics, pixel_level_metrics
 from utils.logger import get_logger, save_args_to_file
 from utils.similarity import calc_similarity_logits, regrid_upsample
+from utils.patch_graph import smooth_patch_tokens
 from utils import (
     setup_seed,
     turn_gradient_off,
@@ -34,6 +35,52 @@ import math
 
 from termcolor import colored
 
+def _debug_print_similarity_samples(model, prompt_learner, dataloader, args, max_each: int):
+    """
+    Print raw cosine similarities to normal/abnormal prompts for a few normal and abnormal samples.
+    This is a sanity check for the prompt directionality.
+    """
+    pos = 0
+    neg = 0
+    with torch.no_grad():
+        for items in dataloader:
+            imgs = items["img"].cuda()
+            gt = items["anomaly"].cpu().numpy().tolist()
+            img_paths = items.get("img_path", [""] * imgs.shape[0])
+
+            image_features, _patch_list = model.encode_image(imgs, args.features_list, self_cor_attn_layers=20)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+            # use the same Bayes conditioning path as inference
+            if getattr(args, "use_bayes_prompt", False) and getattr(args, "bayes_condition_on_image", True):
+                text_features = _encode_text_features_mc(model, prompt_learner, image_features, args)
+            elif args.train_with_img_cls_prob != 0:
+                text_features = _encode_text_features_mc(model, prompt_learner, image_features, args)
+            else:
+                text_features = prompt_learner.text_features.to(imgs.device)  # type: ignore[attr-defined]
+
+            if text_features.shape[0] == 1 and image_features.shape[0] != 1:
+                text_features = text_features.expand(image_features.shape[0], -1, -1)
+
+            # cosine similarities (unscaled)
+            cos = torch.einsum("bc,bkc->bk", image_features, text_features)
+
+            for i in range(imgs.shape[0]):
+                is_abn = int(gt[i])
+                if is_abn == 0 and pos >= max_each:
+                    continue
+                if is_abn == 1 and neg >= max_each:
+                    continue
+                s0 = float(cos[i, 0].detach().cpu())
+                s1 = float(cos[i, 1].detach().cpu())
+                print(f"[dbg-sim] y={is_abn} cos(normal)={s0:.4f} cos(abnormal)={s1:.4f} path={img_paths[i]}")
+                if is_abn == 0:
+                    pos += 1
+                else:
+                    neg += 1
+                if pos >= max_each and neg >= max_each:
+                    return
+
 def _aggregate_text_features_banks(text_pos, text_neg, batch_size, normal_num, anormaly_num):
     if normal_num > 1:
         text_pos = text_pos.view(batch_size, normal_num, -1).mean(dim=1)
@@ -42,15 +89,50 @@ def _aggregate_text_features_banks(text_pos, text_neg, batch_size, normal_num, a
     return torch.stack([text_pos, text_neg], dim=1)
 
 
+def _encode_text_learn_chunked(
+    model,
+    prompts: torch.Tensor,
+    tokenized_prompts: torch.Tensor,
+    compound_prompts_text,
+    chunk_size: int,
+):
+    """
+    Chunked wrapper around model.encode_text_learn to reduce VRAM spikes when encoding many prompts.
+    prompts: (N, 77, C), tokenized_prompts: (N, 77)
+    """
+    n = int(prompts.shape[0])
+    if chunk_size is None or int(chunk_size) <= 0 or int(chunk_size) >= n:
+        return model.encode_text_learn(prompts, tokenized_prompts, compound_prompts_text)
+    outs = []
+    cs = int(chunk_size)
+    for s in range(0, n, cs):
+        e = min(n, s + cs)
+        outs.append(model.encode_text_learn(prompts[s:e], tokenized_prompts[s:e], compound_prompts_text))
+    return torch.cat(outs, dim=0)
+
+
 def _encode_text_features_mc(model, prompt_learner, image_features, args):
     n_samples = int(args.bayes_num_samples) if getattr(args, "use_bayes_prompt", False) else 1
+    text_encode_chunk_size = int(getattr(args, "text_encode_chunk_size", 0) or 0)
     total = None
     for _ in range(n_samples):
         prompts, tokenized_prompts, compound_prompts_text, is_train_with_img_cls = prompt_learner(img_emb=image_features)
 
         if is_train_with_img_cls:
-            tf_pos = model.encode_text_learn(prompts[0], tokenized_prompts[0], compound_prompts_text).float()
-            tf_neg = model.encode_text_learn(prompts[1], tokenized_prompts[1], compound_prompts_text).float()
+            tf_pos = _encode_text_learn_chunked(
+                model,
+                prompts[0],
+                tokenized_prompts[0],
+                compound_prompts_text,
+                chunk_size=text_encode_chunk_size,
+            ).float()
+            tf_neg = _encode_text_learn_chunked(
+                model,
+                prompts[1],
+                tokenized_prompts[1],
+                compound_prompts_text,
+                chunk_size=text_encode_chunk_size,
+            ).float()
             tf = _aggregate_text_features_banks(
                 tf_pos,
                 tf_neg,
@@ -59,7 +141,13 @@ def _encode_text_features_mc(model, prompt_learner, image_features, args):
                 anormaly_num=prompt_learner.anormaly_num,
             )
         else:
-            tf_all = model.encode_text_learn(prompts, tokenized_prompts, compound_prompts_text).float()
+            tf_all = _encode_text_learn_chunked(
+                model,
+                prompts,
+                tokenized_prompts,
+                compound_prompts_text,
+                chunk_size=text_encode_chunk_size,
+            ).float()
             tf_pos = tf_all[: prompt_learner.normal_num].mean(dim=0, keepdim=True)
             tf_neg = tf_all[prompt_learner.normal_num :].mean(dim=0, keepdim=True)
             tf = torch.stack([tf_pos.squeeze(0), tf_neg.squeeze(0)], dim=0).unsqueeze(0)
@@ -72,10 +160,17 @@ def _encode_text_features_mc(model, prompt_learner, image_features, args):
 
 def _encode_text_features_mc_static(model, prompt_learner, args, device):
     n_samples = int(args.bayes_num_samples) if getattr(args, "use_bayes_prompt", False) else 1
+    text_encode_chunk_size = int(getattr(args, "text_encode_chunk_size", 0) or 0)
     total = None
     for _ in range(n_samples):
         prompts, tokenized_prompts, compound_prompts_text, _ = prompt_learner()
-        tf_all = model.encode_text_learn(prompts, tokenized_prompts, compound_prompts_text).float()
+        tf_all = _encode_text_learn_chunked(
+            model,
+            prompts,
+            tokenized_prompts,
+            compound_prompts_text,
+            chunk_size=text_encode_chunk_size,
+        ).float()
         tf_pos = tf_all[: prompt_learner.normal_num].mean(dim=0, keepdim=True)
         tf_neg = tf_all[prompt_learner.normal_num :].mean(dim=0, keepdim=True)
         tf = torch.stack([tf_pos.squeeze(0), tf_neg.squeeze(0)], dim=0).unsqueeze(0)
@@ -98,15 +193,79 @@ class ScoreCalculator(nn.Module):
 
     def forward(self, image):
         with torch.no_grad():
-            image_features, patch_list = self.model.encode_image(image, self.args.features_list, self_cor_attn_layers=20)
+            use_vfm_fusion = bool(getattr(self.args, "vfm_fusion", False))
+            if use_vfm_fusion:
+                image_features, patch_list, vfm_feats_list = self.model.encode_image(
+                    image,
+                    self.args.features_list,
+                    self_cor_attn_layers=20,
+                    vfm_num_layers=int(getattr(self.args, "vfm_num_layers", 4)),
+                    return_vfm_feats=True,
+                )
+            else:
+                image_features, patch_list = self.model.encode_image(image, self.args.features_list, self_cor_attn_layers=20)
+                vfm_feats_list = None
             # patch_features = torch.stack(patch_list, dim=0)
         if self.frm is not None:
             image_features = self.frm(image_features)
             patch_list = [self.frm(pf) for pf in patch_list]
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True) 
-        patch_features = [patch_feature / patch_feature.norm(dim=-1, keepdim=True) for patch_feature in patch_list] # Note 
+        patch_features = [patch_feature / patch_feature.norm(dim=-1, keepdim=True) for patch_feature in patch_list] # Note
+
+        # Multi-scale fusion: fuse CLIP patch tokens with VFM (e.g., DINOv2) intermediate features.
+        if bool(getattr(self.args, "vfm_fusion", False)) and vfm_feats_list is not None and len(vfm_feats_list) > 0:
+            try:
+                # Average intermediate layers in feature space.
+                vfm_feat = torch.stack([vf for vf in vfm_feats_list], dim=0).mean(dim=0)  # (B,C,H,W)
+                B, C, H, W = vfm_feat.shape
+                vfm_tokens = vfm_feat.permute(0, 2, 3, 1).reshape(B, H * W, C)
+                vfm_tokens = vfm_tokens / vfm_tokens.norm(dim=-1, keepdim=True)
+
+                fused = []
+                weight = float(getattr(self.args, "vfm_fusion_weight", 1.0))
+                mode = str(getattr(self.args, "vfm_fusion_mode", "concat_mean"))
+                for pf in patch_features:
+                    Bb, L, Cc = pf.shape
+                    if Bb != B:
+                        vfm_t = vfm_tokens[:Bb]
+                    else:
+                        vfm_t = vfm_tokens
+
+                    # Align token grid if lengths differ.
+                    if vfm_t.shape[1] != L:
+                        g = int(math.isqrt(L))
+                        if g * g == L and H == W:
+                            vf = vfm_feat
+                            if vf.shape[-1] != g or vf.shape[-2] != g:
+                                vf = F.interpolate(vf, size=(g, g), mode="bilinear", align_corners=False)
+                            vfm_t = vf.permute(0, 2, 3, 1).reshape(B, g * g, C)
+                            vfm_t = vfm_t / vfm_t.norm(dim=-1, keepdim=True)
+                        else:
+                            vfm_t = vfm_t[:, :L, :]
+
+                    if vfm_t.shape[-1] != Cc:
+                        # For now, require same embed dim (dinov2_vitb14_reg matches 768).
+                        vfm_t = vfm_t[..., :Cc]
+
+                    if mode == "add":
+                        f = pf + weight * vfm_t
+                    elif mode == "concat_mean":
+                        cat = torch.cat([pf, weight * vfm_t], dim=-1)  # (B,L,2C)
+                        f = cat.view(Bb, L, 2, Cc).mean(dim=2)
+                    else:
+                        raise ValueError(f"Unknown vfm_fusion_mode={mode!r}")
+                    f = f / f.norm(dim=-1, keepdim=True)
+                    fused.append(f)
+                patch_features = fused
+            except Exception:
+                # Best-effort: if VFM fusion fails for any reason, fall back to CLIP-only tokens.
+                pass
+
         patch_features = torch.stack(patch_features, dim=0) 
+        if getattr(self.args, "patch_graph_smooth", False):
+            lam = float(getattr(self.args, "patch_graph_lambda", 0.1))
+            patch_features = torch.stack([smooth_patch_tokens(pf, lam) for pf in patch_features], dim=0)
         # image_features = F.normalize(image_features, dim=-1)
         # patch_features = F.normalize(patch_features, dim=-1)
         
@@ -160,12 +319,14 @@ def compute_metrics_for_object(obj, dataset_results):
     image_f1 = image_level_metrics(dataset_results, obj, "image-f1")
 
     pixel_auroc = pixel_level_metrics(dataset_results, obj, "pixel-auroc")
+    pixel_ap = pixel_level_metrics(dataset_results, obj, "pixel-ap")
     pixel_aupro = pixel_level_metrics(dataset_results, obj, "pixel-aupro")
     pixel_f1 = pixel_level_metrics(dataset_results, obj, "pixel-f1")
 
     dataset_results[obj] = None
     return {
         "pixel_auroc": pixel_auroc,
+        "pixel_ap": pixel_ap,
         "pixel_aupro": pixel_aupro,
         "pixel_f1": pixel_f1,
         "image_auroc": image_auroc,
@@ -208,15 +369,48 @@ def process_dataset(model, dataloader, class_details, args):
             text_features = _encode_text_features_mc_static(model, prompt_learner, args, device="cuda")
         score_calc.text_features = text_features
 
-    dp_calc = nn.DataParallel(score_calc)
+    # Avoid DataParallel overhead/extra memory on single-GPU runs.
+    if torch.cuda.device_count() > 1 and len(getattr(args, "devices", [])) > 1:
+        dp_calc = nn.DataParallel(score_calc)
+    else:
+        dp_calc = score_calc
     dp_calc.eval()
     dp_calc.cuda()
-    
+
+    if getattr(args, "debug_print_similarities", False):
+        n_each = int(getattr(args, "debug_print_n", 5))
+        _debug_print_similarity_samples(model, prompt_learner, dataloader, args, max_each=n_each)
+        if getattr(args, "debug_print_only", False):
+            raise SystemExit(0)
+
     results = {obj: {'gt_sp': [], 'pr_sp': [], 'imgs_masks': [], 'anomaly_maps': [], 'img_paths': []}
             for obj in class_details[1]}
     for items in tqdm(dataloader, desc="Processing test samples"):
         anomaly_score, anomaly_map = dp_calc(items['img'].cuda())
         anomaly_map = torch.stack([torch.from_numpy(gaussian_filter(i, sigma=args.sigma)) for i in anomaly_map.detach().cpu()], dim=0)
+        mean_k = int(getattr(args, "map_mean_ksize", 0) or 0)
+        if mean_k and mean_k > 1:
+            # simple 2D mean filter for spatial consistency (helps AUPRO)
+            am = anomaly_map.unsqueeze(1).float()
+            am = F.avg_pool2d(am, kernel_size=mean_k, stride=1, padding=mean_k // 2)
+            anomaly_map = am.squeeze(1)
+        # Inference trick: derive image-level anomaly score from pixel-level anomaly map
+        # (useful when global CLS score is unreliable after fine-tuning).
+        image_score_mode = getattr(args, "image_score_mode", "cls")
+        if image_score_mode != "cls":
+            flat = anomaly_map.flatten(1)
+            if image_score_mode == "map_max":
+                anomaly_score = flat.max(dim=1).values
+            elif image_score_mode == "map_topk_mean":
+                k = float(getattr(args, "image_score_topk", 100))
+                if 0 < k < 1:
+                    kk = max(1, int(round(k * flat.shape[1])))
+                else:
+                    kk = int(k)
+                kk = max(1, min(kk, flat.shape[1]))
+                anomaly_score = flat.topk(kk, dim=1).values.mean(dim=1)
+            else:
+                raise ValueError(f"Unknown image_score_mode={image_score_mode!r}")
 
         for i in range(items['abnorm_mask'].size(0)):
             inst_cls = items['cls_id'][i].item()
@@ -227,6 +421,23 @@ def process_dataset(model, dataloader, class_details, args):
             results[inst_cls]['img_paths'].append(items['img_path'][i])
     
     torch.cuda.empty_cache()
+
+    # Optional: per-class min-max normalization on image-level scores before computing metrics.
+    # Note: AUROC/AP/F1-max are ranking-based (monotonic-invariant), so this typically does not
+    # change them; kept for compatibility with some evaluation protocols.
+    if getattr(args, "per_class_score_minmax", False):
+        for obj_id, dic in results.items():
+            if len(dic["pr_sp"]) == 0:
+                continue
+            pr = torch.stack(dic["pr_sp"]).float()
+            pr_min = pr.min()
+            pr_max = pr.max()
+            denom = pr_max - pr_min
+            if float(denom) > 0:
+                pr = (pr - pr_min) / denom
+            else:
+                pr = torch.zeros_like(pr)
+            dic["pr_sp"] = [x for x in pr.cpu()]
         
     class_names, class_ids = class_details
     if args.visualize:
@@ -267,7 +478,14 @@ def evaluate(model, items, class_details, args):
         dl_kwargs["prefetch_factor"] = prefetch_factor
     dataloader = DataLoader(items, **dl_kwargs)
     epoch_metrics = process_dataset(model, dataloader, class_details, args)
-    epoch_report = generate_epoch_performance_table(epoch_metrics, class_details[0])
+    # Save machine-readable metrics for later plotting/reporting.
+    epoch_metrics_df = pd.DataFrame(epoch_metrics).set_index("objects")
+    epoch_metrics_df = epoch_metrics_df.loc[class_details[0]]  # Sort
+    epoch_metrics_df.loc["mean"] = epoch_metrics_df.mean()
+    epoch_metrics_df.to_csv(os.path.join(save_path, "summary.csv"))
+    epoch_metrics_df.to_json(os.path.join(save_path, "metrics.json"), orient="index")
+
+    epoch_report = tabulate(epoch_metrics_df, headers="keys", tablefmt="pipe", floatfmt=".03f")
     
     print(args.dataset)
     logger.info("\n%s", epoch_report)
@@ -280,6 +498,12 @@ def test(args):
     if args.dino_model != 'none':
         model.use_DAttn(args.dino_model)
     model = turn_gradient_off(model)
+    if hasattr(model, "logit_scale"):
+        try:
+            ls = float(model.logit_scale.exp().detach().cpu())
+            print(f"logit_scale(exp)={ls:.6f} (temp≈{1.0/ls:.6f})")
+        except Exception:
+            pass
 
     preprocess, target_transform = get_transform(args)
     test_data = Dataset(roots=args.data_path, transform=preprocess, target_transform=target_transform, \
@@ -296,6 +520,9 @@ if __name__ == '__main__':
     parser.add_argument("--visualize", type=str2bool, default=False)
     parser.add_argument("--invert_scores", type=str2bool, default=False, help="debug: invert anomaly scores/maps")
     parser.add_argument("--skip_checkpoint_load", type=str2bool, default=False, help="debug: evaluate with fresh PromptLearner init")
+    parser.add_argument("--debug_print_similarities", type=str2bool, default=False, help="print cosine sims for 5 normal+5 abnormal samples")
+    parser.add_argument("--debug_print_n", type=int, default=5, help="debug: number per class to print")
+    parser.add_argument("--debug_print_only", type=str2bool, default=False, help="debug: exit after printing similarities")
     
     parser.add_argument("--type", type=str, default='test') 
     parser.add_argument("--devices", nargs='+', type=int, default=[0])
@@ -303,6 +530,12 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="dataloader workers (reduce if RAM-limited)")
     parser.add_argument("--prefetch_factor", type=int, default=2, help="dataloader prefetch factor (only if num_workers>0)")
+    parser.add_argument(
+        "--text_encode_chunk_size",
+        type=int,
+        default=0,
+        help="chunk size for text prompt encoding (0 disables; use to avoid CUDA OOM when batch/prompts are large)",
+    )
     parser.add_argument("--aug_rate", type=float, default=0.0, help="augmentation rate")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="optional explicit checkpoint path")
 
@@ -317,6 +550,19 @@ if __name__ == '__main__':
     parser.add_argument("--t_n_ctx", type=int, default=4, help="zero shot")    
     parser.add_argument("--train_with_img_cls_prob", type=float, default=0)
     parser.add_argument("--train_with_img_cls_type", type=str, choices=["none", "replace_prefix", "replace_suffix", "pad_prefix", "pad_suffix"], default="pad_suffix")
+    parser.add_argument(
+        "--ctx_init",
+        type=str,
+        choices=["random", "zeros", "clip"],
+        default="random",
+        help="init for ctx_pos/ctx_neg prompt context vectors",
+    )
+    parser.add_argument(
+        "--ctx_init_phrase",
+        type=str,
+        default="a photo of a",
+        help="when ctx_init=clip, initialize context vectors from this phrase's token embeddings",
+    )
 
     # Bayes-PFL (text-side plugin)
     parser.add_argument("--use_bayes_prompt", type=str2bool, default=False)
@@ -325,6 +571,8 @@ if __name__ == '__main__':
     parser.add_argument("--bayes_flow_type", type=str, choices=["planar", "residual"], default="planar")
     parser.add_argument("--bayes_condition_on_image", type=str2bool, default=True)
     parser.add_argument("--bayes_init_logstd", type=float, default=math.log(0.02))
+    parser.add_argument("--bayes_use_residual", type=str2bool, default=True, help="residual-gate Bayes prompt updates")
+    parser.add_argument("--bayes_residual_alpha_init", type=float, default=0.01, help="init alpha for residual-gated Bayes prompts")
 
     # Feature refinement (attention-ish, minimal-risk)
     parser.add_argument("--frm_type", type=str, choices=["scalar", "linear"], default="scalar")
@@ -336,7 +584,35 @@ if __name__ == '__main__':
     parser.add_argument("--image_size", type=int, default=518, help="input image size")
     parser.add_argument("--features_list", type=int, nargs="+", default=[24], help="layer features used")
     parser.add_argument("--sigma", type=int, default=4, help="zero shot")
+    parser.add_argument("--map_mean_ksize", type=int, default=0, help="optional mean filter kernel size on anomaly map (0 disables)")
     parser.add_argument("--soft_mean", type=str2bool, default=False) 
+
+    # Multi-scale fusion (VFM + CLIP patch tokens)
+    parser.add_argument("--vfm_fusion", type=str2bool, default=False, help="fuse VFM (e.g., DINOv2) intermediate features into CLIP patch tokens")
+    parser.add_argument("--vfm_num_layers", type=int, default=4, help="number of VFM intermediate layers to average for fusion")
+    parser.add_argument("--vfm_fusion_weight", type=float, default=1.0, help="weight of VFM tokens in fusion")
+    parser.add_argument("--vfm_fusion_mode", type=str, choices=["concat_mean", "add"], default="concat_mean", help="fusion mode for CLIP+VFM tokens")
+    parser.add_argument("--patch_graph_smooth", type=str2bool, default=False, help="apply neighbor smoothing on patch tokens")
+    parser.add_argument("--patch_graph_lambda", type=float, default=0.1, help="smoothing strength for patch_graph_smooth")
+    parser.add_argument(
+        "--per_class_score_minmax",
+        type=str2bool,
+        default=False,
+        help="apply per-class min-max normalization to image-level scores before computing metrics",
+    )
+    parser.add_argument(
+        "--image_score_mode",
+        type=str,
+        choices=["cls", "map_max", "map_topk_mean"],
+        default="cls",
+        help="image anomaly score source: cls logits vs pixel anomaly map (max/topk-mean)",
+    )
+    parser.add_argument(
+        "--image_score_topk",
+        type=float,
+        default=100,
+        help="top-k for map_topk_mean; if in (0,1) treated as fraction of pixels",
+    )
 
     parser.add_argument("--attn_type", type=str, choices=["vv", "kk", "qq", "qq+kk", "qq+kk+vv", "(q+k+v)^2"], default="qq+kk+vv")
     parser.add_argument("--both_eattn_dattn", type=str2bool, default=True)

@@ -59,12 +59,14 @@ bash "${ROOT_DIR}/experiments/run_cross_domain.sh" "${TAG}" "${DEVICE}" \
 
 # Heatmap spot-check
 cd "${CRANE_DIR}"
+export CUDA_VISIBLE_DEVICES="${DEVICE}"
 python3 test.py \
   --dataset mvtec \
   --target_class bottle,cable,metal_nut \
   --model_name "trained_on_mvtec_${TAG}" \
   --epoch "${EPOCHS}" \
-  --devices "${DEVICE}" \
+  --devices 0 \
+  --datasets_root_dir "${CRANE_DATASETS_ROOT}" \
   --dino_model dinov2 \
   --use_bayes_prompt True \
   --bayes_condition_on_image True \

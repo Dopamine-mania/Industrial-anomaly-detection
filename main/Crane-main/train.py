@@ -9,6 +9,7 @@ from utils.transform import get_transform
 from utils.loss import FocalLoss, BinaryDiceLoss
 from utils.logger import get_logger
 from utils.similarity import calc_similarity_logits, regrid_upsample
+from utils.patch_graph import smooth_patch_tokens
 from utils import (
     setup_seed,
     seed_worker,
@@ -94,19 +95,54 @@ def _aggregate_text_features_banks(text_pos, text_neg, batch_size, normal_num, a
     return torch.stack([text_pos, text_neg], dim=1)
 
 
+def _encode_text_learn_chunked(
+    model,
+    prompts: torch.Tensor,
+    tokenized_prompts: torch.Tensor,
+    compound_prompts_text,
+    chunk_size: int,
+):
+    """
+    Chunked wrapper around model.encode_text_learn to reduce VRAM spikes when encoding many prompts.
+    prompts: (N, 77, C), tokenized_prompts: (N, 77)
+    """
+    n = int(prompts.shape[0])
+    if chunk_size is None or int(chunk_size) <= 0 or int(chunk_size) >= n:
+        return model.encode_text_learn(prompts, tokenized_prompts, compound_prompts_text)
+    outs = []
+    cs = int(chunk_size)
+    for s in range(0, n, cs):
+        e = min(n, s + cs)
+        outs.append(model.encode_text_learn(prompts[s:e], tokenized_prompts[s:e], compound_prompts_text))
+    return torch.cat(outs, dim=0)
+
+
 def _encode_text_features_mc(model, prompt_learner, image_features, args):
     if getattr(args, "use_bayes_prompt", False):
         n_samples = int(getattr(args, "bayes_num_samples_train", 1))
     else:
         n_samples = 1
+    text_encode_chunk_size = int(getattr(args, "text_encode_chunk_size", 0) or 0)
     total = None
     kl_total = None
     for _ in range(n_samples):
         prompts, tokenized_prompts, compound_prompts_text, is_train_with_img_cls = prompt_learner(img_emb=image_features)
 
         if is_train_with_img_cls:
-            tf_pos = model.encode_text_learn(prompts[0], tokenized_prompts[0], compound_prompts_text).float()
-            tf_neg = model.encode_text_learn(prompts[1], tokenized_prompts[1], compound_prompts_text).float()
+            tf_pos = _encode_text_learn_chunked(
+                model,
+                prompts[0],
+                tokenized_prompts[0],
+                compound_prompts_text,
+                chunk_size=text_encode_chunk_size,
+            ).float()
+            tf_neg = _encode_text_learn_chunked(
+                model,
+                prompts[1],
+                tokenized_prompts[1],
+                compound_prompts_text,
+                chunk_size=text_encode_chunk_size,
+            ).float()
             tf = _aggregate_text_features_banks(
                 tf_pos,
                 tf_neg,
@@ -115,7 +151,13 @@ def _encode_text_features_mc(model, prompt_learner, image_features, args):
                 anormaly_num=prompt_learner.anormaly_num,
             )
         else:
-            tf_all = model.encode_text_learn(prompts, tokenized_prompts, compound_prompts_text).float()
+            tf_all = _encode_text_learn_chunked(
+                model,
+                prompts,
+                tokenized_prompts,
+                compound_prompts_text,
+                chunk_size=text_encode_chunk_size,
+            ).float()
             tf_pos = tf_all[: prompt_learner.normal_num].mean(dim=0, keepdim=True)
             tf_neg = tf_all[prompt_learner.normal_num :].mean(dim=0, keepdim=True)
             tf = torch.stack([tf_pos.squeeze(0), tf_neg.squeeze(0)], dim=0).unsqueeze(0)
@@ -151,6 +193,62 @@ def _find_latest_checkpoint(save_path: str):
     return best_path, best_epoch
 
 
+def _make_synthetic_anomaly_batch(images: torch.Tensor, args):
+    """
+    Create a synthetic "abnormal" view from normal-only images (no test leakage).
+    Returns:
+      syn_images: (B,3,H,W)
+      syn_mask:   (B,1,H,W) binary mask of modified region (for patch supervision)
+    """
+    prob = float(getattr(args, "synthetic_anomaly_prob", 0.0) or 0.0)
+    if prob <= 0.0:
+        return None, None
+
+    mode = str(getattr(args, "synthetic_anomaly_mode", "cutpaste"))
+    noise_std = float(getattr(args, "synthetic_anomaly_noise_std", 0.2))
+    area_min = float(getattr(args, "synthetic_anomaly_area_min", 0.02))
+    area_max = float(getattr(args, "synthetic_anomaly_area_max", 0.15))
+    aspect_min = float(getattr(args, "synthetic_anomaly_aspect_min", 0.3))
+    aspect_max = float(getattr(args, "synthetic_anomaly_aspect_max", 3.0))
+
+    B, C, H, W = images.shape
+    syn = images.clone()
+    mask = torch.zeros((B, 1, H, W), device=images.device, dtype=images.dtype)
+
+    for i in range(B):
+        if torch.rand((), device=images.device).item() > prob:
+            continue
+
+        area_ratio = float(torch.empty((), device=images.device).uniform_(area_min, area_max).item())
+        aspect = float(torch.empty((), device=images.device).uniform_(aspect_min, aspect_max).item())
+
+        rect_area = max(1.0, area_ratio * float(H * W))
+        rect_h = int(round(math.sqrt(rect_area / aspect)))
+        rect_w = int(round(math.sqrt(rect_area * aspect)))
+        rect_h = max(1, min(rect_h, H))
+        rect_w = max(1, min(rect_w, W))
+
+        y0 = int(torch.randint(0, max(1, H - rect_h + 1), (1,), device=images.device).item())
+        x0 = int(torch.randint(0, max(1, W - rect_w + 1), (1,), device=images.device).item())
+        y1 = y0 + rect_h
+        x1 = x0 + rect_w
+
+        if mode == "gaussian":
+            region = syn[i, :, y0:y1, x0:x1]
+            syn[i, :, y0:y1, x0:x1] = region + noise_std * torch.randn_like(region)
+        elif mode == "cutpaste":
+            sy0 = int(torch.randint(0, max(1, H - rect_h + 1), (1,), device=images.device).item())
+            sx0 = int(torch.randint(0, max(1, W - rect_w + 1), (1,), device=images.device).item())
+            patch = syn[i, :, sy0 : sy0 + rect_h, sx0 : sx0 + rect_w].clone()
+            syn[i, :, y0:y1, x0:x1] = patch
+        else:
+            raise ValueError(f"Unknown synthetic_anomaly_mode={mode!r}")
+
+        mask[i, 0, y0:y1, x0:x1] = 1.0
+
+    return syn, mask
+
+
 def _patch_level_ce_loss(patch_features, text_features, labels, temp: float):
     """
     Patch-level CE loss on CLIP patch tokens.
@@ -178,8 +276,66 @@ def _patch_level_ce_loss(patch_features, text_features, labels, temp: float):
         # logits: (B, L, 2)
         patch_logits = calc_similarity_logits(pf, text_features, temp=temp)
         B, L, _ = patch_logits.shape
-        target = labels.view(B, 1).expand(B, L).reshape(-1)
+        if labels.dim() == 2:
+            target = labels.to(device=patch_logits.device).long().reshape(-1)
+        else:
+            target = labels.view(B, 1).expand(B, L).reshape(-1)
         losses.append(F.cross_entropy(patch_logits.reshape(B * L, -1), target))
+    if not losses:
+        return None
+    return torch.stack(losses).mean()
+
+
+def _patch_level_constrained_similarity_loss(
+    patch_features,
+    text_features,
+    labels,
+    temp: float,
+    pos_threshold: float,
+    margin: float,
+):
+    """
+    Constrained similarity loss (normal-only friendly).
+    Enforces:
+      - pos >= pos_threshold
+      - pos - neg >= margin
+    but only until constraints are satisfied (hinge), reducing "runaway" collapse.
+    """
+    if patch_features is None:
+        return None
+    if torch.is_tensor(patch_features):
+        if patch_features.dim() == 4:
+            patch_list = [patch_features[i] for i in range(patch_features.shape[0])]
+        else:
+            patch_list = [patch_features]
+    else:
+        patch_list = list(patch_features)
+    if len(patch_list) == 0:
+        return None
+
+    losses = []
+    for pf in patch_list:
+        if pf is None:
+            continue
+        B, L, _C = pf.shape
+        tf = text_features
+        if tf.shape[0] == 1 and B != 1:
+            tf = tf.expand(B, -1, -1)
+
+        # cosine similarity (scaled by temp for comparability with logits)
+        sim = torch.einsum("blc,bkc->blk", pf, tf) / float(temp)
+
+        if labels.dim() == 2:
+            lbl = labels.long().to(device=sim.device).view(B, L, 1)
+        else:
+            lbl = labels.long().view(B, 1, 1).expand(B, L, 1)
+        pos = sim.gather(2, lbl).squeeze(2)
+        neg = sim.gather(2, 1 - lbl).squeeze(2)
+
+        loss_pos = F.relu(float(pos_threshold) - pos).mean()
+        loss_margin = F.relu(float(margin) - (pos - neg)).mean()
+        losses.append(loss_pos + loss_margin)
+
     if not losses:
         return None
     return torch.stack(losses).mean()
@@ -235,6 +391,21 @@ def train(args):
     prompt_learner.to(device)
     if frm is not None:
         frm.to(device)
+
+    # Prompt training scope: reduce drift to preserve zero-shot manifold.
+    prompt_train_mode = str(getattr(args, "prompt_train_mode", "all"))
+    if prompt_train_mode in {"bayes_only", "residual_only"}:
+        prompt_learner.ctx_pos.requires_grad_(False)
+        prompt_learner.ctx_neg.requires_grad_(False)
+        for p in getattr(prompt_learner, "compound_prompts_text", []):
+            p.requires_grad_(False)
+    if prompt_train_mode == "residual_only":
+        # additionally freeze Bayes modules except the residual alpha gates
+        for name, p in prompt_learner.named_parameters():
+            if name in {"bayes_residual_alpha_pos", "bayes_residual_alpha_neg"}:
+                continue
+            if not (name.startswith("ctx_pos") or name.startswith("ctx_neg") or name.startswith("compound_prompts_text")):
+                p.requires_grad_(False)
 
     # Optional VRAM reservation (cosmetic; does not accelerate training).
     _vram_reservation = _maybe_reserve_vram(args, device)
@@ -299,12 +470,36 @@ def train(args):
                 if precompute:
                     image_features, patch_features = items['image_features'].to(device), items['patch_features'].to(device)
                     patch_features = patch_features.permute(1, 0, *range(2, patch_features.dim())) # 4, N, L, C
+                    mask_for_patches = None
+                    label_img = label
                 else:
                     image = items['img'].to(device)
-                    # Bayes-PFL-aligned training: we still request patch tokens to:
-                    # (1) keep DINO DAttn active (it is computed only for out_layers),
-                    # (2) enable patch-level supervision (spatial constraint).
-                    image_features, patch_features = model.encode_image(image, args.features_list, self_cor_attn_layers=20)
+                    # Optional: synthetic anomalies (normal-only compliant) to create pseudo-negatives.
+                    # Only used in the Bayes-aligned branch (otherwise it would conflict with seg losses).
+                    use_bayes_aligned = bool(getattr(args, "use_bayes_prompt", False) and getattr(args, "bayes_align_official", True))
+                    syn_img = syn_mask = None
+                    if use_bayes_aligned and float(getattr(args, "synthetic_anomaly_prob", 0.0) or 0.0) > 0.0:
+                        syn_img, syn_mask = _make_synthetic_anomaly_batch(image, args)
+
+                    if syn_img is not None and syn_mask is not None:
+                        # Use the synthesized view directly (same batch size).
+                        # Patch supervision uses syn_mask (1 => pseudo-abnormal patch).
+                        image_for_encode = syn_img
+                        mask_for_patches = syn_mask
+                        label_img = label
+                    else:
+                        image_for_encode = image
+                        mask_for_patches = None
+                        label_img = label
+
+                    # Bayes-PFL-aligned training: request patch tokens to keep DINO DAttn active and to enable
+                    # patch-level supervision (spatial constraints).
+                    image_features, patch_features = model.encode_image(
+                        image_for_encode,
+                        args.features_list,
+                        self_cor_attn_layers=20,
+                        vfm_num_layers=int(getattr(args, "vfm_num_layers", 1)),
+                    )
                     # patch_features = torch.stack(patch_features, dim=0) 
                 if frm is not None:
                     image_features = frm(image_features)
@@ -322,6 +517,17 @@ def train(args):
                         patch_features = None
                 elif torch.is_tensor(patch_features):
                     patch_features = patch_features / patch_features.norm(dim=-1, keepdim=True)
+
+                # Optional: patch graph smoothing (neighbor averaging on patch grid).
+                if getattr(args, "patch_graph_smooth", False) and patch_features is not None:
+                    lam = float(getattr(args, "patch_graph_lambda", 0.1))
+                    if torch.is_tensor(patch_features) and patch_features.dim() == 4:
+                        patch_features = torch.stack(
+                            [smooth_patch_tokens(patch_features[i], lam) for i in range(patch_features.shape[0])],
+                            dim=0,
+                        )
+                    elif torch.is_tensor(patch_features) and patch_features.dim() == 3:
+                        patch_features = smooth_patch_tokens(patch_features, lam)
             
                 # Text Features
                 #########################################################################
@@ -330,27 +536,69 @@ def train(args):
 
                 # Bayes-PFL aligned objective: image-level contrast (+ optional PFL regularizer).
                 if getattr(args, "use_bayes_prompt", False) and getattr(args, "bayes_align_official", True):
-                    image_logits = calc_similarity_logits(image_features, text_features, temp=0.01)
-                    ce_img2txt_loss = F.cross_entropy(image_logits, label.long().to(device))
+                    patch_labels = None
+                    if mask_for_patches is not None and patch_features is not None:
+                        try:
+                            if torch.is_tensor(patch_features) and patch_features.dim() == 4:
+                                L = int(patch_features.shape[2])
+                            elif torch.is_tensor(patch_features) and patch_features.dim() == 3:
+                                L = int(patch_features.shape[1])
+                            else:
+                                L = None
+                            if L is not None:
+                                g = int(math.isqrt(L))
+                                if g * g == L:
+                                    pooled = F.adaptive_max_pool2d(mask_for_patches, (g, g)).flatten(1)
+                                    patch_labels = (pooled > 0).to(dtype=torch.long)
+                        except Exception:
+                            patch_labels = None
 
                     patch_ce_temp = float(getattr(args, "bayes_patch_ce_temp", 0.07))
-                    patch_ce_loss = _patch_level_ce_loss(
-                        patch_features,
-                        text_features,
-                        labels=label.long().to(device),
-                        temp=patch_ce_temp,
-                    )
-                    if patch_ce_loss is None:
-                        patch_ce_loss = torch.zeros([], device=device)
+                    patch_loss_mode = str(getattr(args, "bayes_patch_loss", "ce"))
+                    if patch_loss_mode == "ce":
+                        patch_loss = _patch_level_ce_loss(
+                            patch_features,
+                            text_features,
+                            labels=(patch_labels if patch_labels is not None else label_img.long().to(device)),
+                            temp=patch_ce_temp,
+                        )
+                    elif patch_loss_mode == "constrained":
+                        patch_loss = _patch_level_constrained_similarity_loss(
+                            patch_features,
+                            text_features,
+                            labels=(patch_labels if patch_labels is not None else label_img.long().to(device)),
+                            temp=patch_ce_temp,
+                            pos_threshold=float(getattr(args, "bayes_constrained_pos_th", 0.2)),
+                            margin=float(getattr(args, "bayes_constrained_margin", 0.1)),
+                        )
+                    else:
+                        raise ValueError(f"Unknown bayes_patch_loss={patch_loss_mode!r}")
+
+                    if patch_loss is None:
+                        patch_loss = torch.zeros([], device=device)
 
                     pfl_loss = prompt_learner.bayes_pfl_loss()
                     if pfl_loss is None:
                         pfl_loss = torch.zeros([], device=device)
 
-                    ls = float(getattr(args, "bayes_img_ce_weight", 0.2)) * ce_img2txt_loss + float(
-                        getattr(args, "bayes_pfl_weight", 1.0)
-                    ) * pfl_loss
-                    ls = ls + float(getattr(args, "bayes_patch_ce_weight", 1.0)) * patch_ce_loss
+                    kl_w = float(getattr(args, "bayes_kl_weight", 0.0))
+                    if kl_loss is None:
+                        kl_loss_term = torch.zeros([], device=device)
+                    else:
+                        kl_loss_term = kl_loss.to(device=device)
+
+                    img_w = float(getattr(args, "bayes_img_ce_weight", 0.2))
+                    if img_w > 0:
+                        image_logits = calc_similarity_logits(image_features, text_features, temp=0.01)
+                        ce_img2txt_loss = F.cross_entropy(image_logits, label_img.long().to(device))
+                    else:
+                        ce_img2txt_loss = torch.zeros([], device=device)
+
+                    ls = img_w * ce_img2txt_loss
+                    ls = ls + float(getattr(args, "bayes_pfl_weight", 1.0)) * pfl_loss
+                    ls = ls + float(getattr(args, "bayes_patch_ce_weight", 1.0)) * patch_loss
+                    if kl_w > 0:
+                        ls = ls + kl_w * kl_loss_term
 
                     optimizer.zero_grad()
                     ls.backward()
@@ -358,7 +606,7 @@ def train(args):
 
                     loss_list.append((0.0, 0.0, ce_img2txt_loss.item()))
                     batch_tqdm.set_description(
-                        f"ce_fc_ls: {0.0:.3f}, bcd_dice_ls: {0.0:.3f}, ce_img_ls: {ce_img2txt_loss:.3f}, ce_patch_ls: {patch_ce_loss:.3f}"
+                        f"ce_fc_ls: {0.0:.3f}, bcd_dice_ls: {0.0:.3f}, ce_img_ls: {ce_img2txt_loss:.3f}, patch_ls: {patch_loss:.3f}"
                     )
                     continue
 
@@ -442,6 +690,12 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="dataloader workers (reduce if RAM-limited)")
     parser.add_argument("--prefetch_factor", type=int, default=2, help="dataloader prefetch factor (only if num_workers>0)")
+    parser.add_argument(
+        "--text_encode_chunk_size",
+        type=int,
+        default=0,
+        help="chunk size for text prompt encoding (0 disables; use to avoid CUDA OOM when batch/prompts are large)",
+    )
     parser.add_argument("--aug_rate", type=float, default=0.0, help="augmentation rate")
     parser.add_argument("--vram_reserve_frac", type=float, default=0.0, help="reserve GPU VRAM to this used fraction (0 disables)")
     parser.add_argument("--vram_reserve_gb", type=float, default=0.0, help="reserve GPU VRAM to this used GB (0 disables)")
@@ -466,10 +720,31 @@ if __name__ == '__main__':
      
     parser.add_argument("--train_with_img_cls_prob", type=float, default=1)
     parser.add_argument("--train_with_img_cls_type", type=str, choices=["none", "replace_prefix", "replace_suffix", "pad_prefix", "pad_suffix"], default="pad_suffix")
+    parser.add_argument(
+        "--ctx_init",
+        type=str,
+        choices=["random", "zeros", "clip"],
+        default="random",
+        help="init for ctx_pos/ctx_neg prompt context vectors",
+    )
+    parser.add_argument(
+        "--ctx_init_phrase",
+        type=str,
+        default="a photo of a",
+        help="when ctx_init=clip, initialize context vectors from this phrase's token embeddings",
+    )
     parser.add_argument("--dino_model", type=str, choices=['none', 'dinov2', 'dino', 'sam'], default='dinov2')
+    parser.add_argument("--vfm_num_layers", type=int, default=1, help="number of VFM intermediate layers to use inside the visual encoder (for DAttn).")
     parser.add_argument("--both_eattn_dattn", type=str2bool, default=True)
     parser.add_argument("--use_scorebase_pooling", type=str2bool, default=True) 
     parser.add_argument("--attn_type", type=str, choices=["vv", "kk", "qq", "qq+kk", "qq+kk+vv", "(q+k+v)^2"], default="qq+kk+vv")
+    parser.add_argument(
+        "--prompt_train_mode",
+        type=str,
+        choices=["all", "bayes_only", "residual_only"],
+        default="all",
+        help="which PromptLearner params to train (reduces drift vs zero-shot)",
+    )
 
     # Bayes-PFL (text-side plugin)
     parser.add_argument("--use_bayes_prompt", type=str2bool, default=False)
@@ -479,12 +754,26 @@ if __name__ == '__main__':
     parser.add_argument("--bayes_kl_weight", type=float, default=0.01)
     parser.add_argument("--bayes_condition_on_image", type=str2bool, default=True)
     parser.add_argument("--bayes_init_logstd", type=float, default=math.log(0.02))
+    parser.add_argument("--bayes_use_residual", type=str2bool, default=True, help="residual-gate Bayes prompt updates")
+    parser.add_argument("--bayes_residual_alpha_init", type=float, default=0.01, help="init alpha for residual-gated Bayes prompts")
     parser.add_argument("--bayes_align_official", type=str2bool, default=True)
     parser.add_argument("--bayes_num_samples_train", type=int, default=1)
     parser.add_argument("--bayes_pfl_weight", type=float, default=1.0)
     parser.add_argument("--bayes_img_ce_weight", type=float, default=0.2)
     parser.add_argument("--bayes_patch_ce_weight", type=float, default=1.0, help="patch-level CE weight (Bayes aligned training)")
     parser.add_argument("--bayes_patch_ce_temp", type=float, default=0.07, help="patch-level CE temperature")
+    parser.add_argument("--bayes_patch_loss", type=str, choices=["ce", "constrained"], default="ce", help="patch loss for Bayes aligned training")
+    parser.add_argument("--bayes_constrained_pos_th", type=float, default=0.2, help="constrained loss: min similarity threshold for positives")
+    parser.add_argument("--bayes_constrained_margin", type=float, default=0.1, help="constrained loss: pos-neg margin")
+    parser.add_argument("--patch_graph_smooth", type=str2bool, default=False, help="apply neighbor smoothing on patch tokens")
+    parser.add_argument("--patch_graph_lambda", type=float, default=0.1, help="smoothing strength for patch_graph_smooth")
+    parser.add_argument("--synthetic_anomaly_prob", type=float, default=0.0, help="probability to synthesize anomalies from normal images")
+    parser.add_argument("--synthetic_anomaly_mode", type=str, choices=["cutpaste", "gaussian"], default="cutpaste", help="synthetic anomaly type")
+    parser.add_argument("--synthetic_anomaly_noise_std", type=float, default=0.2, help="std for gaussian synthetic anomalies")
+    parser.add_argument("--synthetic_anomaly_area_min", type=float, default=0.02, help="min rectangle area ratio for synthetic anomalies")
+    parser.add_argument("--synthetic_anomaly_area_max", type=float, default=0.15, help="max rectangle area ratio for synthetic anomalies")
+    parser.add_argument("--synthetic_anomaly_aspect_min", type=float, default=0.3, help="min aspect ratio (w/h) for synthetic anomalies")
+    parser.add_argument("--synthetic_anomaly_aspect_max", type=float, default=3.0, help="max aspect ratio (w/h) for synthetic anomalies")
 
     # Feature refinement (attention-ish, minimal-risk)
     parser.add_argument("--use_feature_refinement_module", type=str2bool, default=False)

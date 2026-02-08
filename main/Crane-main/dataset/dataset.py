@@ -4,7 +4,10 @@ import random
 from PIL import Image
 import numpy as np
 import os
-import albumentations as A
+try:
+    import albumentations as A  # type: ignore
+except Exception:  # pragma: no cover
+    A = None
 
 def anomaly_map_guided_crop(img, img_mask):
     # Convert mask to numpy for bounding box calculation
@@ -134,18 +137,26 @@ class Dataset(data.Dataset):
         self.target_transform = target_transform
         
         self.aug_rate = kwargs.aug_rate
-        pr=0.20 # 0.5 #
-        self.img_trans = A.Compose([
-			A.Rotate(limit=30, p=pr),
-			A.RandomRotate90(p=pr),
-			A.RandomBrightnessContrast(p=pr),
-			A.GaussNoise(p=pr),
-			A.OneOf([
-				A.Blur(blur_limit=3, p=pr),
-				A.ColorJitter(p=pr),
-				A.GaussianBlur(p=pr),
-			], p=pr)
-		], is_check_shapes=False)
+        self.img_trans = None
+        if A is not None and float(self.aug_rate) > 0:
+            pr = 0.20  # 0.5 #
+            self.img_trans = A.Compose(
+                [
+                    A.Rotate(limit=30, p=pr),
+                    A.RandomRotate90(p=pr),
+                    A.RandomBrightnessContrast(p=pr),
+                    A.GaussNoise(p=pr),
+                    A.OneOf(
+                        [
+                            A.Blur(blur_limit=3, p=pr),
+                            A.ColorJitter(p=pr),
+                            A.GaussianBlur(p=pr),
+                        ],
+                        p=pr,
+                    ),
+                ],
+                is_check_shapes=False,
+            )
         
         meta_infos = {}
         dataset_split = 'train' if getattr(kwargs, "type", "test") == 'train' else 'test'
@@ -211,6 +222,8 @@ class Dataset(data.Dataset):
         print(f"number of samples: {self.length}")
 
     def augment(self, img , img_mask):
+        if self.img_trans is None:
+            return img, img_mask
         img_mask = np.array(img_mask)
         img = np.array(img)
         augmentations = self.img_trans(mask=img_mask, image=img)
