@@ -96,8 +96,17 @@ def pixel_level_metrics(results, obj, metric):
             gt = gt.squeeze(1)
         if len(pr.shape) == 4:
             pr = pr.squeeze(1)
-        performance = cal_pro_score_gpu(gt, pr)
-        # performance = cal_pro_score(gt, pr)
+        # AUPRO requires connected-component statistics. Prefer a dependency-light
+        # implementation when scikit-image isn't available.
+        if measure is None:
+            performance = calculate_au_pro(
+                gt.detach().cpu().numpy(),
+                pr.detach().cpu().numpy(),
+                integration_limit=0.3,
+                num_thresholds=200,
+            )[0]
+        else:
+            performance = cal_pro_score_gpu(gt, pr)
     elif metric == 'pixel-ap':     # NOTE: The order in sklearn and torch metrics is inverse
         # gt = np.array(gt.cpu()); pr = np.array(pr.cpu())
         # performance= average_precision_score(gt.ravel(), pr.ravel())
