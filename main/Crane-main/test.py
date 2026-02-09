@@ -179,7 +179,7 @@ def _encode_text_features_mc_static(model, prompt_learner, args, device):
         total = tf if total is None else (total + tf)
     return total / float(n_samples)
 
-def _encode_text_prompt_banks_fixed(model, class_name: str, device: str = "cuda"):
+def _encode_text_prompt_banks_fixed(model, class_name: str, args=None, device: str = "cuda"):
     """
     WinCLIP-style fixed prompts: encode normal/abnormal prompt banks.
     Returns:
@@ -187,6 +187,7 @@ def _encode_text_prompt_banks_fixed(model, class_name: str, device: str = "cuda"
       tf_neg_bank: (Q, C) normalized
     """
     from models.state_prompts import NORMAL_STATE_TEMPLATES, ABNORMAL_STATE_TEMPLATES
+    from models import prompt_ensemble as _pe  # for tokenizer ids (SOT/EOT)
 
     prompts_pos = [t.format(class_name) for t in NORMAL_STATE_TEMPLATES]
     prompts_neg = [t.format(class_name) for t in ABNORMAL_STATE_TEMPLATES]
@@ -197,15 +198,47 @@ def _encode_text_prompt_banks_fixed(model, class_name: str, device: str = "cuda"
     # list inputs. `encode_text()` (standard CLIP path) will fail due to this architectural change.
     # We therefore reuse `encode_text_learn()` with an empty deep prompt list to emulate standard CLIP.
     cast_dtype = model.transformer.get_cast_dtype()
-    with torch.no_grad():
-        emb_pos = model.token_embedding(tokens_pos).type(cast_dtype)
-        emb_neg = model.token_embedding(tokens_neg).type(cast_dtype)
+    fixed_bayes = bool(getattr(args, "fixed_prompts_bayes", False)) if args is not None else False
+    fixed_bayes_num_samples = int(getattr(args, "fixed_prompts_bayes_num_samples", 8)) if args is not None else 8
+    fixed_bayes_logstd = float(getattr(args, "fixed_prompts_bayes_init_logstd", math.log(0.02))) if args is not None else math.log(0.02)
 
-        tf_pos = model.encode_text_learn(emb_pos, tokens_pos, deep_compound_prompts_text=[]).float()
-        tf_neg = model.encode_text_learn(emb_neg, tokens_neg, deep_compound_prompts_text=[]).float()
-        tf_pos = F.normalize(tf_pos, dim=-1)
-        tf_neg = F.normalize(tf_neg, dim=-1)
-    return tf_pos, tf_neg
+    sot_id = int(_pe._tokenizer.encoder["<|startoftext|>"])
+    eot_id = int(_pe._tokenizer.encoder["<|endoftext|>"])
+
+    def _mask_for_noise(tokens: torch.Tensor) -> torch.Tensor:
+        # perturb only "content" tokens (exclude padding + SOT/EOT)
+        return (tokens != 0) & (tokens != sot_id) & (tokens != eot_id)
+
+    with torch.no_grad():
+        base_emb_pos = model.token_embedding(tokens_pos).type(cast_dtype)
+        base_emb_neg = model.token_embedding(tokens_neg).type(cast_dtype)
+
+        if (not fixed_bayes) or fixed_bayes_num_samples <= 1:
+            tf_pos = model.encode_text_learn(base_emb_pos, tokens_pos, deep_compound_prompts_text=[]).float()
+            tf_neg = model.encode_text_learn(base_emb_neg, tokens_neg, deep_compound_prompts_text=[]).float()
+            tf_pos = F.normalize(tf_pos, dim=-1)
+            tf_neg = F.normalize(tf_neg, dim=-1)
+            return tf_pos, tf_neg
+
+        sigma = float(math.exp(fixed_bayes_logstd))
+        m_pos = _mask_for_noise(tokens_pos).unsqueeze(-1).to(dtype=base_emb_pos.dtype)
+        m_neg = _mask_for_noise(tokens_neg).unsqueeze(-1).to(dtype=base_emb_neg.dtype)
+
+        tf_pos_acc = None
+        tf_neg_acc = None
+        for _ in range(fixed_bayes_num_samples):
+            emb_pos = base_emb_pos + sigma * torch.randn_like(base_emb_pos) * m_pos
+            emb_neg = base_emb_neg + sigma * torch.randn_like(base_emb_neg) * m_neg
+            tf_pos = model.encode_text_learn(emb_pos, tokens_pos, deep_compound_prompts_text=[]).float()
+            tf_neg = model.encode_text_learn(emb_neg, tokens_neg, deep_compound_prompts_text=[]).float()
+            tf_pos = F.normalize(tf_pos, dim=-1)
+            tf_neg = F.normalize(tf_neg, dim=-1)
+            tf_pos_acc = tf_pos if tf_pos_acc is None else (tf_pos_acc + tf_pos)
+            tf_neg_acc = tf_neg if tf_neg_acc is None else (tf_neg_acc + tf_neg)
+
+        tf_pos = F.normalize(tf_pos_acc / float(fixed_bayes_num_samples), dim=-1)
+        tf_neg = F.normalize(tf_neg_acc / float(fixed_bayes_num_samples), dim=-1)
+        return tf_pos, tf_neg
 
 
 def _reduce_prompt_scores(scores: torch.Tensor, mode: str):
@@ -456,7 +489,7 @@ def process_dataset(model, dataloader, class_details, args):
         elif getattr(args, "target_class", None) and "," not in str(args.target_class):
             class_name = str(args.target_class).strip()
         with torch.no_grad():
-            tf_pos, tf_neg = _encode_text_prompt_banks_fixed(model, class_name, device="cuda")
+            tf_pos, tf_neg = _encode_text_prompt_banks_fixed(model, class_name, args=args, device="cuda")
             score_calc.fixed_tf_pos_bank = tf_pos
             score_calc.fixed_tf_neg_bank = tf_neg
     elif args.train_with_img_cls_prob == 0 and not (getattr(args, "use_bayes_prompt", False) and getattr(args, "bayes_condition_on_image", True)):
@@ -636,6 +669,9 @@ if __name__ == '__main__':
     parser.add_argument("--fixed_prompts", type=str2bool, default=False, help="use fixed WinCLIP-style state prompts (no learnable prompt tokens)")
     parser.add_argument("--fixed_prompt_classname", type=str, default=None, help="override class name used in fixed prompts (defaults to target_class if single class)")
     parser.add_argument("--fixed_prompts_reduce", type=str, choices=["max", "mean", "logsumexp"], default="max", help="reduction over fixed prompt bank")
+    parser.add_argument("--fixed_prompts_bayes", type=str2bool, default=False, help="Bayes-PFL-style MC sampling on fixed prompt token embeddings (inference only)")
+    parser.add_argument("--fixed_prompts_bayes_num_samples", type=int, default=8, help="MC samples for fixed_prompts_bayes")
+    parser.add_argument("--fixed_prompts_bayes_init_logstd", type=float, default=math.log(0.02), help="log std for fixed_prompts_bayes noise")
 
     parser.add_argument("--datasets_root_dir", type=str, default=f"{DATASETS_ROOT}")
     parser.add_argument("--dataset", type=str, default="mvtec")
