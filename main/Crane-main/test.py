@@ -464,7 +464,16 @@ def process_dataset(model, dataloader, class_details, args):
     
     score_base_pooling = Crane.ScoreBasePooling()
     frm = None
-    if checkpoint is not None and "feature_refinement_module" in checkpoint:
+    if bool(getattr(args, "use_feature_refinement_module", False)):
+        dim = model.ln_final.weight.shape[0]
+        frm = FeatureRefinementModule(
+            dim=dim,
+            mode=getattr(args, "frm_type", "scalar"),
+            alpha_init=float(getattr(args, "frm_alpha_init", 0.0)),
+        ).cuda()
+        if checkpoint is not None and "feature_refinement_module" in checkpoint:
+            frm.load_state_dict(checkpoint["feature_refinement_module"], strict=True)
+    elif checkpoint is not None and "feature_refinement_module" in checkpoint:
         dim = model.ln_final.weight.shape[0]
         frm = FeatureRefinementModule(
             dim=dim,
@@ -709,6 +718,7 @@ if __name__ == '__main__':
     parser.add_argument("--bayes_residual_alpha_init", type=float, default=0.01, help="init alpha for residual-gated Bayes prompts")
 
     # Feature refinement (attention-ish, minimal-risk)
+    parser.add_argument("--use_feature_refinement_module", type=str2bool, default=False)
     parser.add_argument("--frm_type", type=str, choices=["scalar", "linear"], default="scalar")
     parser.add_argument("--frm_alpha_init", type=float, default=0.0)
 
