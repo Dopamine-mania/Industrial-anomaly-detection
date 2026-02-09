@@ -1,12 +1,20 @@
 from sklearn.metrics import auc, roc_auc_score, average_precision_score, f1_score, precision_recall_curve
 
 import numpy as np
-from skimage import measure
+try:
+    from skimage import measure  # type: ignore
+except Exception:  # pragma: no cover
+    measure = None
 import torch
 from torchmetrics import AUROC, AveragePrecision
 import time
 
 def cal_pro_score(masks, amaps, max_step=200, expect_fpr=0.3):
+    if measure is None:
+        raise RuntimeError(
+            "cal_pro_score requires scikit-image (skimage). "
+            "Install scikit-image or use cal_pro_score_gpu/calculate_au_pro instead."
+        )
     # ref: https://github.com/gudovskiy/cflow-ad/blob/master/train.py
     binary_amaps = np.zeros_like(amaps, dtype=bool)
     min_th, max_th = amaps.min(), amaps.max()
