@@ -1,0 +1,2 @@
+git_commit: 66eafd85a9927a30a0a323a11d2d4b05317b4ca1
+source_run: main/Crane-main/results/zs_fixedprompts_mvtec_all_reduce_mean_bayes8_sigma001/test_on_mvtec/2174cb24
