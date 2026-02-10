@@ -23,13 +23,19 @@ def main():
     ap.add_argument("--out_png", type=Path, default=None)
     ap.add_argument("--metric", type=str, default="image_auroc", choices=["image_auroc", "pixel_auroc"])
     ap.add_argument(
+        "--test_dataset",
+        type=str,
+        default=None,
+        help="Optional filter on test_dataset (e.g. mvtec, visa).",
+    )
+    ap.add_argument(
         "--order",
         nargs="+",
         default=[
-            "trained_on_mvtec_baseline",
-            "trained_on_mvtec_bayes_dino",
-            "trained_on_visa_baseline",
-            "trained_on_visa_bayes_dino",
+            "baseline_clip_fixedprompts_mvtec",
+            "zs_fixedprompts_mvtec_all_reduce_mean_rerun6",
+            "zs_fixedprompts_mvtec_all_reduce_mean_bayes8_sigma001",
+            "baseline_clip_fixedprompts_mvtec_attention",
         ],
         help="model_name order for plotting",
     )
@@ -38,6 +44,8 @@ def main():
     rows = read_csv(args.summary_csv)
     grouped = defaultdict(list)
     for r in rows:
+        if args.test_dataset and r.get("test_dataset", "") != args.test_dataset:
+            continue
         model_name = r.get("model_name", "")
         v = to_float(r.get(args.metric, ""))
         if v is None:
@@ -49,7 +57,7 @@ def main():
     for m in args.order:
         if m not in grouped:
             continue
-        labels.append(m.replace("trained_on_mvtec_", "").replace("trained_on_visa_", ""))
+        labels.append(m)
         values.append(sum(grouped[m]) / len(grouped[m]))
 
     if not values:
