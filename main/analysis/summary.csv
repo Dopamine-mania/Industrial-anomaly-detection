@@ -36,6 +36,7 @@ image_ap,image_auroc,image_f1,log_path,model_name,pixel_ap,pixel_aupro,pixel_aur
 0.695,0.419,0.836,main/Crane-main/results/trained_on_mvtec_bayes_dino_patchce_tuned_e30/test_on_mvtec/8821f5ea/epoch_30/log.txt,trained_on_mvtec_bayes_dino_patchce_tuned_e30,,0.61,0.766,0.22,mvtec
 0.764,0.539,0.842,main/Crane-main/results/trained_on_mvtec_bayes_dino_patchce_tuned_e30/test_on_mvtec/47f3802a/epoch_30/log.txt,trained_on_mvtec_bayes_dino_patchce_tuned_e30,0.163,0.61,0.766,0.22,mvtec
 0.75,0.517,0.838,main/Crane-main/results/trained_on_mvtec_bayes_dino_patchce_tuned_e30/test_on_mvtec/b12056ab/epoch_30/log.txt,trained_on_mvtec_bayes_dino_patchce_tuned_e30,0.131,0.555,0.734,0.191,mvtec
+0.942,0.865,0.905,main/Crane-main/results/ablation_mvtec_bayes_frm_scalar_a01/test_on_mvtec/087180a6/epoch_0/log.txt,ablation_mvtec_bayes_frm_scalar_a01,0.409,0.878,0.911,0.461,mvtec
 0.8,0.551,0.84,main/Crane-main/results/trained_on_visa_bayes_dino/test_on_mvtec/93d2063f/epoch_1/log.txt,trained_on_visa_bayes_dino,,0.59,0.852,0.281,mvtec
 0.964,0.872,0.903,main/Crane-main/results/zs_fixedprompts_bottle_smoketest/test_on_mvtec/9c8ae1a4/epoch_0/log.txt,zs_fixedprompts_bottle_smoketest,0.593,0.841,0.922,0.569,mvtec
 0.745,0.681,0.755,main/Crane-main/results/zs_fixedprompts_visa_all_reduce_mean/test_on_visa/96b5532e/epoch_0/log.txt,zs_fixedprompts_visa_all_reduce_mean,0.178,0.809,0.847,0.262,visa

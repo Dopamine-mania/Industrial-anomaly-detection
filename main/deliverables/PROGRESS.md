@@ -32,11 +32,15 @@ Backups live in `main/deliverables/ours_best_zs_fixedprompts_dino/`.
 - Ablation plots (current): `main/analysis/ablation_pixel_auroc_mvtec.png`, `main/analysis/ablation_image_auroc_mvtec.png`
 
 ## In progress
-- “+Attention” ablation on top of Best/Bayes configuration (FRM scalar).
-- Heatmap visualizations for a few representative classes (Bottle/Cable/Hazelnut).
+- Heatmap visualizations for a few representative classes (Hazelnut pending).
+
+## Newly completed (since last update)
+- “+Attention” ablation (FRM scalar) on MVTec (mean metrics are essentially unchanged vs +Bayes).
+- Heatmap samples exported for report:
+  - `main/deliverables/heatmaps/mvtec/bottle/`
+  - `main/deliverables/heatmaps/mvtec/cable/`
 
 ## Next actions
 - Finish “+Attention” eval and regenerate ablation plots with 4 bars.
 - Generate 6–12 representative `vis_img` pairs (`*_orig.png`, `*_pred.png`) for report.
 - Optional (if required by PM): run **trained-on-MVTec** and **trained-on-VisA** checkpoints for “trained_on_A → test_on_B” cross-domain tables.
-

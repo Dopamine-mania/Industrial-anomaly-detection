@@ -35,11 +35,18 @@ def main():
             "baseline_clip_fixedprompts_mvtec",
             "zs_fixedprompts_mvtec_all_reduce_mean_rerun6",
             "zs_fixedprompts_mvtec_all_reduce_mean_bayes8_sigma001",
-            "baseline_clip_fixedprompts_mvtec_attention",
+            "ablation_mvtec_bayes_frm_scalar_a01",
         ],
         help="model_name order for plotting",
     )
     args = ap.parse_args()
+
+    pretty = {
+        "baseline_clip_fixedprompts_mvtec": "Base",
+        "zs_fixedprompts_mvtec_all_reduce_mean_rerun6": "+DINO",
+        "zs_fixedprompts_mvtec_all_reduce_mean_bayes8_sigma001": "+Bayes",
+        "ablation_mvtec_bayes_frm_scalar_a01": "+Attention",
+    }
 
     rows = read_csv(args.summary_csv)
     grouped = defaultdict(list)
@@ -57,7 +64,7 @@ def main():
     for m in args.order:
         if m not in grouped:
             continue
-        labels.append(m)
+        labels.append(pretty.get(m, m))
         values.append(sum(grouped[m]) / len(grouped[m]))
 
     if not values:
