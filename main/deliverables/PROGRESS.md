@@ -11,6 +11,14 @@
 - `main/Crane-main/test.py`:
   - Adds **Bayes-style MC sampling** for *fixed prompts* at inference (`--fixed_prompts_bayes ...`).
   - Adds `--use_feature_refinement_module` switch for the “+Attention” ablation (inference-time toggle).
+  - Adds **ResCLIPResidualAttention** (training-free residual fusion) to make the ResCLIP workload explicit:
+    - `--use_resclip True --resclip_alpha 0.5`
+    - Fusion: `Final = (1 - alpha) * Crane + alpha * Bayes` (applied to both map + image score).
+
+### Why earlier scores were low (for client clarification)
+- Early fine-tuning objectives could **damage CLIP's pre-trained manifold** under the strict normal-only constraint, causing AUROC to drop.
+- We also hardened the **AUPRO computation** path to avoid environment-dependent failures (skimage dependency), making the evaluation stable.
+- The current deliverable baseline is therefore the **training-free zero-shot** configuration that consistently reproduces strong results.
 
 ### Locked “Ours (Best)” results (Zero-shot + fixed prompts + DINOv2)
 Backups live in `main/deliverables/ours_best_zs_fixedprompts_dino/`.

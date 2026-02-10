@@ -3,6 +3,7 @@ image_ap,image_auroc,image_f1,log_path,model_name,pixel_ap,pixel_aupro,pixel_aur
 0.964,0.873,0.903,main/Crane-main/results/zs_fixedprompts_bottle_bayes8_sigma001/test_on_mvtec/85d9e780/epoch_0/log.txt,zs_fixedprompts_bottle_bayes8_sigma001,0.592,0.841,0.922,0.569,mvtec
 0.844,0.811,0.806,main/Crane-main/results/zs_fixedprompts_visa_reduce_mean_mapmax_bayes8_sigma001/test_on_visa/f9b7689c/epoch_0/log.txt,zs_fixedprompts_visa_reduce_mean_mapmax_bayes8_sigma001,0.178,0.809,0.847,0.262,visa
 0.948,0.877,0.909,main/Crane-main/results/baseline_clip_fixedprompts_mvtec/test_on_mvtec/0d4ee9eb/epoch_0/log.txt,baseline_clip_fixedprompts_mvtec,0.326,0.818,0.882,0.393,mvtec
+0.964,0.872,0.903,main/Crane-main/results/vis_mvtec_bottle_zs_dino/test_on_mvtec/27776923/epoch_0/log.txt,vis_mvtec_bottle_zs_dino,0.593,0.841,0.922,0.569,mvtec
 0.873,0.721,0.863,main/Crane-main/results/trained_on_mvtec_synth_cutpaste_ctxclip_nctx4_bottle_e5/test_on_mvtec/096cb24a/epoch_5/log.txt,trained_on_mvtec_synth_cutpaste_ctxclip_nctx4_bottle_e5,0.181,0.559,0.712,0.237,mvtec
 0.671,0.345,0.834,main/Crane-main/results/trained_on_visa_baseline/test_on_mvtec/4e53e325/epoch_1/log.txt,trained_on_visa_baseline,,0.364,0.738,0.12,mvtec
 0.954,0.858,0.889,main/Crane-main/results/zs_fixedprompts_bottle_mapmax_v2/test_on_mvtec/b2ae8da4/epoch_0/log.txt,zs_fixedprompts_bottle_mapmax_v2,0.575,0.826,0.911,0.557,mvtec
@@ -23,6 +24,7 @@ image_ap,image_auroc,image_f1,log_path,model_name,pixel_ap,pixel_aupro,pixel_aur
 0.976,0.94,0.937,main/Crane-main/results/trained_on_visa_cranep/test_on_mvtec/magnesium-massachusetts/epoch_5/log.txt,trained_on_visa_cranep,,0.881,0.912,0.437,mvtec
 0.906,0.89,0.856,main/Crane-main/results/trained_on_visa_cranep/test_on_visa/magnesium-massachusetts/epoch_5/log.txt,trained_on_visa_cranep,,0.907,0.96,0.319,visa
 0.942,0.865,0.904,main/Crane-main/results/zs_fixedprompts_mvtec_all_reduce_mean_rerun6/test_on_mvtec/9f02763d/epoch_0/log.txt,zs_fixedprompts_mvtec_all_reduce_mean_rerun6,0.408,0.877,0.911,0.461,mvtec
+0.722,0.592,0.763,main/Crane-main/results/vis_mvtec_cable_zs_dino/test_on_mvtec/16daf1a3/epoch_0/log.txt,vis_mvtec_cable_zs_dino,0.165,0.642,0.767,0.25,mvtec
 0.846,0.814,0.808,main/Crane-main/results/zs_fixedprompts_visa_reduce_mean_mapmax_sigma0/test_on_visa/70401fb8/epoch_0/log.txt,zs_fixedprompts_visa_reduce_mean_mapmax_sigma0,0.166,0.808,0.843,0.252,visa
 0.815,0.535,0.863,main/Crane-main/results/trained_on_mvtec_bayes_dino_full/test_on_mvtec/0e1050e4/epoch_50/log.txt,trained_on_mvtec_bayes_dino_full,,0.129,0.356,0.109,mvtec
 0.786,0.465,0.863,main/Crane-main/results/trained_on_mvtec_bayes_dino_full/test_on_mvtec/0bf7455f/epoch_50/log.txt,trained_on_mvtec_bayes_dino_full,,0.249,0.644,0.188,mvtec
@@ -38,12 +40,14 @@ image_ap,image_auroc,image_f1,log_path,model_name,pixel_ap,pixel_aupro,pixel_aur
 0.75,0.517,0.838,main/Crane-main/results/trained_on_mvtec_bayes_dino_patchce_tuned_e30/test_on_mvtec/b12056ab/epoch_30/log.txt,trained_on_mvtec_bayes_dino_patchce_tuned_e30,0.131,0.555,0.734,0.191,mvtec
 0.942,0.865,0.905,main/Crane-main/results/ablation_mvtec_bayes_frm_scalar_a01/test_on_mvtec/087180a6/epoch_0/log.txt,ablation_mvtec_bayes_frm_scalar_a01,0.409,0.878,0.911,0.461,mvtec
 0.8,0.551,0.84,main/Crane-main/results/trained_on_visa_bayes_dino/test_on_mvtec/93d2063f/epoch_1/log.txt,trained_on_visa_bayes_dino,,0.59,0.852,0.281,mvtec
+0.964,0.873,0.903,main/Crane-main/results/smoke_resclip_bottle/test_on_mvtec/2d759b96/epoch_0/log.txt,smoke_resclip_bottle,0.592,0.841,0.922,0.569,mvtec
 0.964,0.872,0.903,main/Crane-main/results/zs_fixedprompts_bottle_smoketest/test_on_mvtec/9c8ae1a4/epoch_0/log.txt,zs_fixedprompts_bottle_smoketest,0.593,0.841,0.922,0.569,mvtec
 0.745,0.681,0.755,main/Crane-main/results/zs_fixedprompts_visa_all_reduce_mean/test_on_visa/96b5532e/epoch_0/log.txt,zs_fixedprompts_visa_all_reduce_mean,0.178,0.809,0.847,0.262,visa
 0.769,0.415,0.863,main/Crane-main/results/trained_on_mvtec_synth_cutpaste_ctxclip_bottle_e5_v3/test_on_mvtec/b5370745/epoch_5/log.txt,trained_on_mvtec_synth_cutpaste_ctxclip_bottle_e5_v3,0.09,0.332,0.522,0.138,mvtec
 0.704,0.282,0.863,main/Crane-main/results/trained_on_mvtec_bayes_dino_full_bottle_dbg/test_on_mvtec/0e1050e4/epoch_5/log.txt,trained_on_mvtec_bayes_dino_full_bottle_dbg,,0.16,0.395,0.109,mvtec
 0.765,0.416,0.863,main/Crane-main/results/trained_on_mvtec_bayes_dino_full_bottle_dbg/test_on_mvtec/0e1050e4/epoch_1/log.txt,trained_on_mvtec_bayes_dino_full_bottle_dbg,,0.226,0.595,0.136,mvtec
 0.608,0.16,0.863,main/Crane-main/results/trained_on_mvtec_bayes_dino_full_bottle_dbg/test_on_mvtec/63e87b9a/epoch_0/log.txt,trained_on_mvtec_bayes_dino_full_bottle_dbg,,0.144,0.586,0.138,mvtec
+0.942,0.865,0.904,main/Crane-main/results/ablation_mvtec_resclip_alpha05/test_on_mvtec/d27917d2/epoch_0/log.txt,ablation_mvtec_resclip_alpha05,0.409,0.878,0.911,0.461,mvtec
 0.606,0.19,0.863,main/Crane-main/results/trained_on_mvtec_residual_margin_bottle_e5_v2/test_on_mvtec/c6b5da5c/epoch_5/log.txt,trained_on_mvtec_residual_margin_bottle_e5_v2,0.068,0.164,0.591,0.139,mvtec
 0.823,0.502,0.881,main/Crane-main/results/trained_on_mvtec_synth_cutpaste_ctxclip_zipper_e5_v2/test_on_mvtec/3072aaf5/epoch_5/log.txt,trained_on_mvtec_synth_cutpaste_ctxclip_zipper_e5_v2,0.021,0.115,0.512,0.042,mvtec
 0.921,0.745,0.888,main/Crane-main/results/trained_on_mvtec_synth_cutpaste_ctxclip_zipper_e5_v2/test_on_mvtec/7ed5d48b/epoch_5/log.txt,trained_on_mvtec_synth_cutpaste_ctxclip_zipper_e5_v2,0.06,0.315,0.664,0.138,mvtec

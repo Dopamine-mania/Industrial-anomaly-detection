@@ -8,6 +8,7 @@ from models import Crane
 from models.prompt_ensemble import PromptLearner
 from models.prompt_ensemble import tokenize as clip_tokenize
 from models.feature_refinement import FeatureRefinementModule
+from models.resclip import ResCLIPResidualAttention
 from dataset.dataset import Dataset
 from __init__ import DATASETS_ROOT
 
@@ -285,6 +286,17 @@ class ScoreCalculator(nn.Module):
         self._cached_text = {}
         self.fixed_tf_pos_bank = None
         self.fixed_tf_neg_bank = None
+        # ResCLIP: keep both deterministic and Bayes banks to enable residual fusion at inference.
+        self.fixed_tf_pos_bank_base = None
+        self.fixed_tf_neg_bank_base = None
+        self.fixed_tf_pos_bank_bayes = None
+        self.fixed_tf_neg_bank_bayes = None
+        self.resclip = None
+        if bool(getattr(self.args, "use_resclip", False)):
+            self.resclip = ResCLIPResidualAttention(
+                alpha=float(getattr(self.args, "resclip_alpha", 0.5)),
+                learnable_alpha=bool(getattr(self.args, "resclip_learnable_alpha", False)),
+            ).cuda()
 
     def forward(self, image):
         with torch.no_grad():
@@ -376,29 +388,53 @@ class ScoreCalculator(nn.Module):
 
         # Similarity Map - Segmentation
         #########################################################################
-        pixel_logits_list = []
         fixed_reduce = str(getattr(self.args, "fixed_prompts_reduce", "max"))
-        for patch_feature in patch_features:
-            if fixed_prompts:
-                pixel_logits = _fixed_prompt_logits(
-                    patch_feature,
-                    self.fixed_tf_pos_bank,
-                    self.fixed_tf_neg_bank,
-                    temp=0.07,
-                    reduce=fixed_reduce,
-                )
-            else:
-                pixel_logits = calc_similarity_logits(patch_feature, text_features)
-            pixel_logits_list.append(pixel_logits)
+        pixel_logits_list = []
 
-        if self.args.soft_mean:    
-            similarity_maps = [regrid_upsample(pl.softmax(dim=-1), args.image_size) for pl in pixel_logits_list]
-            score_map = torch.stack(similarity_maps).mean(dim=0)
+        def _anomaly_map_from_pixel_logits(pl_list):
+            if self.args.soft_mean:
+                similarity_maps = [regrid_upsample(pl.softmax(dim=-1), args.image_size) for pl in pl_list]
+                score_map = torch.stack(similarity_maps).mean(dim=0)
+            else:
+                logits_maps = [regrid_upsample(pl, args.image_size) for pl in pl_list]
+                mean_logits_map = torch.stack(logits_maps).mean(dim=0)
+                score_map = mean_logits_map.softmax(dim=-1)
+            return score_map[..., 1]
+
+        if fixed_prompts:
+            def _pixel_logits_list_for_bank(tf_pos, tf_neg):
+                out = []
+                for patch_feature in patch_features:
+                    out.append(
+                        _fixed_prompt_logits(
+                            patch_feature,
+                            tf_pos,
+                            tf_neg,
+                            temp=0.07,
+                            reduce=fixed_reduce,
+                        )
+                    )
+                return out
+
+            use_resclip = bool(getattr(self.args, "use_resclip", False)) and self.resclip is not None
+            if use_resclip:
+                assert self.fixed_tf_pos_bank_base is not None and self.fixed_tf_neg_bank_base is not None
+                assert self.fixed_tf_pos_bank_bayes is not None and self.fixed_tf_neg_bank_bayes is not None
+
+                pixel_logits_list_base = _pixel_logits_list_for_bank(self.fixed_tf_pos_bank_base, self.fixed_tf_neg_bank_base)
+                pixel_logits_list_bayes = _pixel_logits_list_for_bank(self.fixed_tf_pos_bank_bayes, self.fixed_tf_neg_bank_bayes)
+                anomaly_map_base = _anomaly_map_from_pixel_logits(pixel_logits_list_base)
+                anomaly_map_bayes = _anomaly_map_from_pixel_logits(pixel_logits_list_bayes)
+                anomaly_map = self.resclip(anomaly_map_base, anomaly_map_bayes)
+                # For score-base pooling downstream, keep the base list to avoid unexpected behavior changes.
+                pixel_logits_list = pixel_logits_list_base
+            else:
+                pixel_logits_list = _pixel_logits_list_for_bank(self.fixed_tf_pos_bank, self.fixed_tf_neg_bank)
+                anomaly_map = _anomaly_map_from_pixel_logits(pixel_logits_list)
         else:
-            logits_maps = [regrid_upsample(pl, args.image_size) for pl in pixel_logits_list]
-            mean_logits_map = torch.stack(logits_maps).mean(dim=0)
-            score_map = mean_logits_map.softmax(dim=-1)
-        anomaly_map = score_map[..., 1]
+            for patch_feature in patch_features:
+                pixel_logits_list.append(calc_similarity_logits(patch_feature, text_features))
+            anomaly_map = _anomaly_map_from_pixel_logits(pixel_logits_list)
 
         # Classification Score
         #########################################################################
@@ -409,17 +445,42 @@ class ScoreCalculator(nn.Module):
             image_features = F.normalize(image_features, dim=1)
 
         if fixed_prompts:
-            image_logits = _fixed_prompt_logits(
-                image_features,
-                self.fixed_tf_pos_bank,
-                self.fixed_tf_neg_bank,
-                temp=0.07,
-                reduce=fixed_reduce,
-            )
+            use_resclip = bool(getattr(self.args, "use_resclip", False)) and self.resclip is not None
+            if use_resclip:
+                assert self.fixed_tf_pos_bank_base is not None and self.fixed_tf_neg_bank_base is not None
+                assert self.fixed_tf_pos_bank_bayes is not None and self.fixed_tf_neg_bank_bayes is not None
+
+                image_logits_base = _fixed_prompt_logits(
+                    image_features,
+                    self.fixed_tf_pos_bank_base,
+                    self.fixed_tf_neg_bank_base,
+                    temp=0.07,
+                    reduce=fixed_reduce,
+                )
+                image_logits_bayes = _fixed_prompt_logits(
+                    image_features,
+                    self.fixed_tf_pos_bank_bayes,
+                    self.fixed_tf_neg_bank_bayes,
+                    temp=0.07,
+                    reduce=fixed_reduce,
+                )
+                image_pred_base = image_logits_base.softmax(dim=-1)
+                image_pred_bayes = image_logits_bayes.softmax(dim=-1)
+                anomaly_score = self.resclip(image_pred_base[:, 1], image_pred_bayes[:, 1]).detach()
+            else:
+                image_logits = _fixed_prompt_logits(
+                    image_features,
+                    self.fixed_tf_pos_bank,
+                    self.fixed_tf_neg_bank,
+                    temp=0.07,
+                    reduce=fixed_reduce,
+                )
+                image_pred = image_logits.softmax(dim=-1)
+                anomaly_score = image_pred[:, 1].detach()
         else:
             image_logits = calc_similarity_logits(image_features, text_features)
-        image_pred = image_logits.softmax(dim=-1)
-        anomaly_score = image_pred[:, 1].detach()
+            image_pred = image_logits.softmax(dim=-1)
+            anomaly_score = image_pred[:, 1].detach()
 
         if getattr(self.args, "invert_scores", False):
             anomaly_score = 1.0 - anomaly_score
@@ -497,10 +558,29 @@ def process_dataset(model, dataloader, class_details, args):
             class_name = str(args.fixed_prompt_classname)
         elif getattr(args, "target_class", None) and "," not in str(args.target_class):
             class_name = str(args.target_class).strip()
+        import copy
         with torch.no_grad():
-            tf_pos, tf_neg = _encode_text_prompt_banks_fixed(model, class_name, args=args, device="cuda")
-            score_calc.fixed_tf_pos_bank = tf_pos
-            score_calc.fixed_tf_neg_bank = tf_neg
+            # Deterministic bank (Crane branch)
+            args_base = copy.copy(args)
+            args_base.fixed_prompts_bayes = False
+            tf_pos_base, tf_neg_base = _encode_text_prompt_banks_fixed(model, class_name, args=args_base, device="cuda")
+            score_calc.fixed_tf_pos_bank_base = tf_pos_base
+            score_calc.fixed_tf_neg_bank_base = tf_neg_base
+
+            # Bayes bank (Bayes-PFL branch)
+            args_bayes = copy.copy(args)
+            args_bayes.fixed_prompts_bayes = True
+            tf_pos_bayes, tf_neg_bayes = _encode_text_prompt_banks_fixed(model, class_name, args=args_bayes, device="cuda")
+            score_calc.fixed_tf_pos_bank_bayes = tf_pos_bayes
+            score_calc.fixed_tf_neg_bank_bayes = tf_neg_bayes
+
+            # Default active bank (used when --use_resclip is False)
+            if bool(getattr(args, "fixed_prompts_bayes", False)):
+                score_calc.fixed_tf_pos_bank = tf_pos_bayes
+                score_calc.fixed_tf_neg_bank = tf_neg_bayes
+            else:
+                score_calc.fixed_tf_pos_bank = tf_pos_base
+                score_calc.fixed_tf_neg_bank = tf_neg_base
     elif args.train_with_img_cls_prob == 0 and not (getattr(args, "use_bayes_prompt", False) and getattr(args, "bayes_condition_on_image", True)):
         with torch.no_grad():
             text_features = _encode_text_features_mc_static(model, prompt_learner, args, device="cuda")
@@ -681,6 +761,11 @@ if __name__ == '__main__':
     parser.add_argument("--fixed_prompts_bayes", type=str2bool, default=False, help="Bayes-PFL-style MC sampling on fixed prompt token embeddings (inference only)")
     parser.add_argument("--fixed_prompts_bayes_num_samples", type=int, default=8, help="MC samples for fixed_prompts_bayes")
     parser.add_argument("--fixed_prompts_bayes_init_logstd", type=float, default=math.log(0.02), help="log std for fixed_prompts_bayes noise")
+
+    # ResCLIP: Residual Attention (training-free) for dense vision-language inference
+    parser.add_argument("--use_resclip", type=str2bool, default=False, help="enable ResCLIP fusion: Final=(1-a)*Crane + a*Bayes")
+    parser.add_argument("--resclip_alpha", type=float, default=0.5, help="fusion alpha in Final=(1-a)*Crane + a*Bayes")
+    parser.add_argument("--resclip_learnable_alpha", type=str2bool, default=False, help="make alpha learnable (only matters when training)")
 
     parser.add_argument("--datasets_root_dir", type=str, default=f"{DATASETS_ROOT}")
     parser.add_argument("--dataset", type=str, default="mvtec")

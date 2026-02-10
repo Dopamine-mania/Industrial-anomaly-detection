@@ -35,6 +35,7 @@ def main():
             "baseline_clip_fixedprompts_mvtec",
             "zs_fixedprompts_mvtec_all_reduce_mean_rerun6",
             "zs_fixedprompts_mvtec_all_reduce_mean_bayes8_sigma001",
+            "ablation_mvtec_resclip_alpha05",
             "ablation_mvtec_bayes_frm_scalar_a01",
         ],
         help="model_name order for plotting",
@@ -45,6 +46,7 @@ def main():
         "baseline_clip_fixedprompts_mvtec": "Base",
         "zs_fixedprompts_mvtec_all_reduce_mean_rerun6": "+DINO",
         "zs_fixedprompts_mvtec_all_reduce_mean_bayes8_sigma001": "+Bayes",
+        "ablation_mvtec_resclip_alpha05": "+ResCLIP",
         "ablation_mvtec_bayes_frm_scalar_a01": "+Attention",
     }
 
