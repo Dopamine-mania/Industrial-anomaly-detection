@@ -76,6 +76,32 @@ def main():
             md_lines.append("| " + " | ".join(str(r.get(k, "")) for k in fieldnames) + " |")
         md = "\n".join(md_lines)
 
+    # Add a cross-domain view note: for training-free zero-shot runs, "trained_on_X -> test_on_Y"
+    # collapses to directly evaluating on Y.
+    try:
+        mvtec_best = next(r for r in rows if r["setting"].startswith("MVTec (Best"))
+        visa_best = next(r for r in rows if r["setting"].startswith("VisA (Best"))
+        cross_rows = [
+            {"direction": "MVTec -> VisA", "pixel_auroc": visa_best["pixel_auroc"], "image_auroc": visa_best["image_auroc"]},
+            {"direction": "VisA -> MVTec", "pixel_auroc": mvtec_best["pixel_auroc"], "image_auroc": mvtec_best["image_auroc"]},
+        ]
+        cross_md = tabulate(
+            [[r["direction"], r["pixel_auroc"], r["image_auroc"]] for r in cross_rows],
+            headers=["direction", "pixel_auroc", "image_auroc"],
+            tablefmt="github",
+            floatfmt=".4f",
+        )
+        md = (
+            md
+            + "\n\n"
+            + "### Cross-domain view (training-free)\n\n"
+            + "The current *best* setting is **zero-shot / training-free**. Therefore, the cross-domain directions reduce to evaluating on the target domain:\n\n"
+            + cross_md
+            + "\n"
+        )
+    except Exception:
+        pass
+
     args.out_md.parent.mkdir(parents=True, exist_ok=True)
     args.out_md.write_text(md + "\n", encoding="utf-8")
     print(f"Wrote {args.out_csv}")
@@ -84,4 +110,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
